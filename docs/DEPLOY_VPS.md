@@ -79,6 +79,8 @@ gatekeeper update            pull, back up, rebuild, restart, check; rolls back 
 gatekeeper backup | restore FILE
 gatekeeper start | stop | restart     (stop also pauses the watchdog, also across reboots)
 gatekeeper uninstall         removes services/containers; asks before touching data
+                             (unattended: --yes keeps your data; add --purge to also delete data, .env, images, certificates)
+gatekeeper restore FILE --yes  restores without asking (add --with-env to also restore the saved .env)
 sudo ./install.sh --reconfigure       ask everything again
 ```
 
@@ -94,6 +96,15 @@ Precedence: defaults < existing `.env` < `--config FILE` < environment < wizard 
 variables: `HA_BASE_URL HA_TOKEN ADMIN_PASSWORD GATEKEEPER_MODE GATEKEEPER_DOMAIN ACME_EMAIL
 ALERT_WEBHOOK_URL ADMIN_ALLOWED_IPS AUDIT_LOG_RETENTION_DAYS HA_CA_FILE`. A generated admin password
 is printed once at the end. Every setting is documented in [`deploy/env.example`](../deploy/env.example).
+
+## Firewall
+
+The installer opens ports 80/443 in ufw or firewalld when one is active. If ufw is installed but off, it
+offers to switch it on allowing only your SSH port(s) (read from sshd, so you cannot lock yourself out),
+80 and 443; set `GATEKEEPER_UFW=1` to do that unattended or `GATEKEEPER_UFW=0` to never ask. If Home
+Assistant runs on the same server it also allows the Docker networks to reach that one port. Rules it
+adds are removed again when you switch to private mode or uninstall (the SSH rule is never touched).
+Docker bypasses ufw for published ports, so the app's own port stays bound to `127.0.0.1` regardless.
 
 ## Behind the scenes
 
