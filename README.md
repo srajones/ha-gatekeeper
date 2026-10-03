@@ -33,6 +33,14 @@ The public Gatekeeper API port is disabled by default. To allow trusted LAN agen
 
 Add-on releases use prebuilt GHCR images at `ghcr.io/wookingwoo/ha-gatekeeper`, tagged by add-on version.
 
+## Install on a VPS (one script)
+
+```bash
+git clone https://github.com/srajones/ha-gatekeeper.git && cd ha-gatekeeper && sudo ./install.sh
+```
+
+`install.sh` installs Docker if needed, asks for your Home Assistant URL/token and admin password (secrets are generated), sets up HTTPS with Caddy, starts everything with automatic restarts and a watchdog, and finishes with a full health check. Re-run it any time to repair; use `gatekeeper verify|status|logs|update|backup` afterwards. See [docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md).
+
 ## Local Development
 
 1. Install dependencies.
