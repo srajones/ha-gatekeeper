@@ -203,7 +203,7 @@ run_logged() {
   out="$(mktemp_tracked)"
   info "$msg"
   if ! $QUIET; then
-    ( while sleep 25; do printf '       ... still working (%ss)\n' "$((SECONDS - start))"; done ) &
+    ( exec 200>&-; while sleep 25; do printf '       ... still working (%ss)\n' "$((SECONDS - start))"; done ) &
     ticker=$!
   fi
   if $VERBOSE; then
@@ -1460,6 +1460,8 @@ Documentation=https://github.com/srajones/ha-gatekeeper
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+# 'gatekeeper stop' must stay stopped across a reboot.
+ConditionPathExists=!$STATE_DIR/paused
 
 [Service]
 Type=oneshot
@@ -1664,7 +1666,10 @@ front_door() {
   if proxy_enabled; then
     local host="${CFG[GATEKEEPER_DOMAIN]}"
     if is_ipv4 "$host"; then
-      FD_BASE="https://127.0.0.1" # --resolve does not apply to IP literals; default_sni serves the certificate
+      # --resolve does not apply to IP literals: connect to loopback, present the right Host, and
+      # let default_sni choose the certificate.
+      FD_BASE="https://127.0.0.1"
+      FD_ARGS+=(-H "Host: $host")
     else
       FD_BASE="https://$host"
       FD_ARGS+=(--resolve "$host:443:127.0.0.1")
@@ -1990,7 +1995,7 @@ verify_public() {
   local tries=1
   [[ "$mode" == domain ]] && tries=24 # Caddy may still be obtaining the certificate
   for ((i = 1; i <= tries; i++)); do
-    if http_do GET "$FD_BASE/healthz" "" "${extra[@]}" && [[ "$LAST_CODE" == 200 ]]; then ok=true; break; fi
+    if http_do GET "$FD_BASE/healthz" "" "${extra[@]}" && [[ "$LAST_CODE" == 200 && "$LAST_BODY" == *'"ok":true'* ]]; then ok=true; break; fi
     if (( i == 1 && tries > 1 )); then info "Waiting for the HTTPS certificate (usually under a minute)..."; fi
     (( i < tries )) && sleep 5
   done
@@ -2009,7 +2014,7 @@ verify_public() {
   cert="$(printf '' | openssl s_client -connect 127.0.0.1:443 -servername "$host" 2>/dev/null | openssl x509 -noout -enddate -issuer 2>/dev/null || true)"
   end="$(sed -n 's/^notAfter=//p' <<<"$cert")"
   issuer="$(sed -n 's/^issuer=//p' <<<"$cert")"
-  if [[ -n "$end" ]]; then
+  if [[ -n "$end" && "$mode" == domain ]]; then
     days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
     if (( days < 14 )); then
       vwarn "The certificate expires in $days days ($end)" "Caddy renews automatically; if it stays this low, check: docker logs $CADDY_CONTAINER"
@@ -2899,7 +2904,7 @@ cmd_status() {
       state="$(container_field "$name" '{{.State.Status}}')"
       health="$(container_field "$name" '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}')"
       since="$(container_field "$name" '{{.State.StartedAt}}')"
-      say "  $(printf '%-15s' "${name#ha-gatekeeper}"): $state ($health), up since ${since%%.*}, restarts: $(container_field "$name" '{{.RestartCount}}')"
+      say "  $(printf '%-15s' "$([[ "$name" == "$CADDY_CONTAINER" ]] && echo 'HTTPS proxy' || echo 'Gatekeeper')"): $state ($health), up since ${since%%.*}, restarts: $(container_field "$name" '{{.RestartCount}}')"
     else
       say "  $(printf '%-15s' "$name"): ${C_RED}missing${C_RESET}"
     fi
