@@ -2366,7 +2366,7 @@ wizard_mode() {
   local ip choice default cur="${CFG[GATEKEEPER_MODE]:-}"
   ip="$(public_ip 4 || true)"
   PUBLIC_IPV4="$ip"
-  case "$cur" in domain) default=1 ;; selfsigned) default=2 ;; local) default=3 ;; *) default=1 ;; esac
+  case "$cur" in domain) default=1 ;; selfsigned) default=2 ;; local) default=3 ;; *) default=2 ;; esac
 
   say ""
   say "${C_BOLD}How do you want to reach HA Gatekeeper (admin page and API)?${C_RESET}"
@@ -2377,6 +2377,9 @@ wizard_mode() {
   say "  2) HTTPS on this server's IP     ${C_DIM}Works right away, no domain. Self-signed certificate: browsers${C_RESET}"
   say "                                   ${C_DIM}warn once, and API clients must be told to trust it.${C_RESET}"
   say "  3) Private (SSH tunnel only)     ${C_DIM}Nothing is exposed to the internet; you connect with ssh -L.${C_RESET}"
+  say ""
+  say "  ${C_DIM}Not sure? Choose 2: it works immediately with just the server's IP address. You can switch to a${C_RESET}"
+  say "  ${C_DIM}domain later by running  sudo gatekeeper install --reconfigure .${C_RESET}"
   say ""
   while true; do
     choice="$(ask "Choose 1, 2 or 3" "$default")"
@@ -2513,7 +2516,7 @@ wizard_admin_password() {
   if [[ -n "${CFG[ADMIN_PASSWORD]:-}" ]] && confirm "Keep the current admin password?" y; then
     return 0
   fi
-  choice="$(ask "[G]enerate a strong random password (recommended) or [T]ype your own" "G")"
+  choice="$(ask "[T]ype your own password, or [G]enerate a strong random one" "T")"
   case "${choice,,}" in
     t*)
       while true; do
