@@ -1,0 +1,103 @@
+# HA Gatekeeper - Docker Compose stack for a single Linux server (VPS).
+#
+# You normally never edit or run this by hand: `sudo ./install.sh` asks for the settings,
+# writes `.env`, generates the Caddy config, starts everything and checks that it works.
+# To run it manually instead:
+#
+#   cp deploy/env.example .env        # then fill in the REQUIRED values
+#   docker compose up -d --build
+#
+# Services
+#   gatekeeper  API + admin UI. Always on. Published on 127.0.0.1 only, because Docker
+#               bypasses UFW/firewalld for published ports; loopback is the only reliable way
+#               to keep it private.
+#   caddy       HTTPS reverse proxy on ports 80/443 with automatic certificates. Only started
+#               when COMPOSE_PROFILES=proxy is set in .env (install.sh does this for you).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    # Cap container logs (5 x 10 MB per container) so they can never fill the disk.
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  gatekeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ha-gatekeeper:local
+    container_name: ha-gatekeeper
+    # Restart on crash, on failed health check escalation (see deploy/watchdog.sh) and on
+    # reboot, but not after an explicit `docker stop`.
+    restart: unless-stopped
+    # tini as PID 1: forwards signals (fast, clean stops) and reaps zombie processes.
+    init: true
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      DATABASE_URL: "file:/data/ha-gatekeeper.db"
+      HA_BASE_URL: "${HA_BASE_URL:?HA_BASE_URL is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      HA_TOKEN: "${HA_TOKEN:?HA_TOKEN is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?ADMIN_PASSWORD is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      ADMIN_SESSION_SECRET: "${ADMIN_SESSION_SECRET:?ADMIN_SESSION_SECRET is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      API_KEY_HASH_SECRET: "${API_KEY_HASH_SECRET:?API_KEY_HASH_SECRET is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:8080}"
+      AUDIT_LOG_RETENTION_DAYS: "${AUDIT_LOG_RETENTION_DAYS:-90}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Set to 1 by install.sh when Caddy is in front, so audit logs and the admin-login rate
+      # limit see the real client IP instead of the proxy's. Leave empty when not behind a proxy.
+      TRUST_PROXY: "${TRUST_PROXY:-}"
+      # Optional: trust a private CA for Home Assistant (path inside the container, under /certs).
+      NODE_EXTRA_CA_CERTS: "${HA_CA_CERT:-}"
+    ports:
+      - "${GATEKEEPER_BIND:-127.0.0.1}:${GATEKEEPER_PORT:-8080}:8080"
+    volumes:
+      # SQLite database. Must be writable by uid 1001 (install.sh takes care of this).
+      - "${GATEKEEPER_DATA_DIR:-./data}:/data:z"
+      - "./deploy/certs:/certs:ro,z"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *default-logging
+
+  caddy:
+    image: "${CADDY_IMAGE:-caddy:2-alpine}"
+    container_name: ha-gatekeeper-caddy
+    profiles: ["proxy"]
+    restart: unless-stopped
+    depends_on:
+      gatekeeper:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      # Directory (not a single file) so edits are always seen and Docker can never create a
+      # bogus directory named Caddyfile when the file is missing.
+      - "./deploy/caddy:/etc/caddy:ro,z"
+      # Certificates and the ACME account live here. Do not delete this volume needlessly:
+      # Let's Encrypt rate-limits re-issuing certificates.
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "--tries=1", "--timeout=3", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+volumes:
+  caddy_data:
+  caddy_config:

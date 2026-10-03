@@ -33,7 +33,8 @@ test("standalone mode resolves HA config, admin secrets, CORS origin, and port",
     HA_GATEKEEPER_ADDON: false,
     ADDON_EXPOSE_API: false,
     LOG_LEVEL: "debug",
-    AUDIT_LOG_RETENTION_DAYS: 90
+    AUDIT_LOG_RETENTION_DAYS: 90,
+    TRUST_PROXY: false
   });
 });
 
@@ -47,6 +48,48 @@ test("AUDIT_LOG_RETENTION_DAYS defaults to 90 and accepts an explicit override",
     resolveRuntimeConfig({ ...validStandaloneEnv, AUDIT_LOG_RETENTION_DAYS: "0" }).AUDIT_LOG_RETENTION_DAYS,
     0
   );
+});
+
+test("TRUST_PROXY is disabled by default and for explicit off values", () => {
+  assert.equal(resolveRuntimeConfig(validStandaloneEnv).TRUST_PROXY, false);
+
+  for (const value of ["", "  ", "false", "FALSE", "0", "00", "no", "off"]) {
+    assert.equal(resolveRuntimeConfig({ ...validStandaloneEnv, TRUST_PROXY: value }).TRUST_PROXY, false, value);
+  }
+});
+
+test("TRUST_PROXY accepts true, a hop count, or a list of IPs, CIDRs and keywords", () => {
+  const resolve = (value: string) => resolveRuntimeConfig({ ...validStandaloneEnv, TRUST_PROXY: value }).TRUST_PROXY;
+
+  assert.equal(resolve("true"), true);
+  assert.equal(resolve("On"), true);
+  assert.equal(resolve("1"), 1);
+  assert.equal(resolve("2"), 2);
+  assert.deepEqual(resolve("172.16.0.0/12"), ["172.16.0.0/12"]);
+  assert.deepEqual(resolve("10.0.0.1, 192.168.0.0/16 ,fd00::/8"), ["10.0.0.1", "192.168.0.0/16", "fd00::/8"]);
+  assert.deepEqual(resolve("Loopback,uniquelocal"), ["loopback", "uniquelocal"]);
+});
+
+test("TRUST_PROXY rejects values Fastify would fail on at startup", () => {
+  for (const value of ["maybe", "10.0.0.0/33", "fd00::/129", "10.0.0.1/abc", "10.0.0.1/8/8", "999.1.1.1", ",", "1,2"]) {
+    assert.throws(
+      () => resolveRuntimeConfig({ ...validStandaloneEnv, TRUST_PROXY: value }),
+      /TRUST_PROXY/,
+      value
+    );
+  }
+});
+
+test("add-on mode ignores TRUST_PROXY so X-Forwarded-For cannot spoof the ingress IP", () => {
+  const env = resolveRuntimeConfig({
+    HA_GATEKEEPER_ADDON: "true",
+    SUPERVISOR_TOKEN: "supervisor-token",
+    ADMIN_SESSION_SECRET: "session-secret",
+    API_KEY_HASH_SECRET: "api-key-hash-secret",
+    TRUST_PROXY: "true"
+  });
+
+  assert.equal(env.TRUST_PROXY, false);
 });
 
 test("add-on mode uses supervisor core API and SUPERVISOR_TOKEN", () => {

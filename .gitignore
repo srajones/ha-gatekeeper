@@ -18,3 +18,11 @@ playwright-report/
 .superpowers/
 docs/superpowers/
 .worktrees/
+
+# Docker/VPS deployment: generated or private (see install.sh)
+/data/
+/backups/
+/deploy/caddy/Caddyfile
+/deploy/certs/*
+!/deploy/certs/.gitkeep
+/gatekeeper-root-ca.crt

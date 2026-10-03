@@ -17,3 +17,10 @@ playwright-report/
 .git
 .github
 .worktrees/
+
+# Docker/VPS deployment files that must never enter the build context
+data
+backups
+deploy/caddy
+deploy/certs
+gatekeeper-root-ca.crt

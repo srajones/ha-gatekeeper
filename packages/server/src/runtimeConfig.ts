@@ -1,7 +1,54 @@
+import { isIP } from "node:net";
 import { z } from "zod";
 
 const nodeEnvSchema = z.enum(["development", "test", "production"]).default("development");
 const logLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info");
+
+// Mirrors Fastify's `trustProxy` option. `false` (the default) keeps the socket peer as the
+// client address. Anything else derives `request.ip` from X-Forwarded-For, so it must only be
+// set behind a reverse proxy that overwrites that header.
+export type TrustProxySetting = boolean | number | string[];
+
+const TRUST_PROXY_KEYWORDS = new Set(["loopback", "linklocal", "uniquelocal"]);
+
+const trustProxySchema = z
+  .string()
+  .trim()
+  .default("")
+  .transform((value, ctx): TrustProxySetting => {
+    const normalized = value.toLowerCase();
+
+    if (!normalized || ["false", "0", "no", "off"].includes(normalized)) {
+      return false;
+    }
+
+    if (["true", "yes", "on"].includes(normalized)) {
+      return true;
+    }
+
+    if (/^\d+$/.test(normalized)) {
+      const hops = Number(normalized);
+      return hops > 0 ? hops : false;
+    }
+
+    const entries = normalized
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const invalid = entries.find((entry) => !isValidTrustProxyEntry(entry));
+
+    if (entries.length === 0 || invalid !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `TRUST_PROXY must be false, true, a hop count, or a comma-separated list of IPs/CIDRs (got "${
+          invalid ?? value
+        }")`
+      });
+      return z.NEVER;
+    }
+
+    return entries;
+  });
 
 export type RuntimeConfig = {
   NODE_ENV: z.infer<typeof nodeEnvSchema>;
@@ -17,6 +64,7 @@ export type RuntimeConfig = {
   ADDON_EXPOSE_API: boolean;
   LOG_LEVEL: z.infer<typeof logLevelSchema>;
   AUDIT_LOG_RETENTION_DAYS: number;
+  TRUST_PROXY: TrustProxySetting;
 };
 
 const commonSchema = z.object({
@@ -33,7 +81,8 @@ const commonSchema = z.object({
 const standaloneSchema = commonSchema.extend({
   HA_BASE_URL: z.string().trim().url(),
   HA_TOKEN: z.string().trim().min(1),
-  ADMIN_PASSWORD: z.string().trim().min(8)
+  ADMIN_PASSWORD: z.string().trim().min(8),
+  TRUST_PROXY: trustProxySchema
 });
 
 const addonSchema = commonSchema.extend({
@@ -61,7 +110,11 @@ export function resolveRuntimeConfig(raw: Record<string, string | undefined>): R
       HA_GATEKEEPER_ADDON,
       ADDON_EXPOSE_API,
       LOG_LEVEL: parsed.LOG_LEVEL,
-      AUDIT_LOG_RETENTION_DAYS: parsed.AUDIT_LOG_RETENTION_DAYS
+      AUDIT_LOG_RETENTION_DAYS: parsed.AUDIT_LOG_RETENTION_DAYS,
+      // Never honored in add-on mode: ingress trust is decided from the real socket peer
+      // (see adminAuth.ts), so letting X-Forwarded-For rewrite `request.ip` would let a LAN
+      // client impersonate the Supervisor proxy.
+      TRUST_PROXY: false
     };
   }
 
@@ -80,8 +133,28 @@ export function resolveRuntimeConfig(raw: Record<string, string | undefined>): R
     HA_GATEKEEPER_ADDON,
     ADDON_EXPOSE_API,
     LOG_LEVEL: parsed.LOG_LEVEL,
-    AUDIT_LOG_RETENTION_DAYS: parsed.AUDIT_LOG_RETENTION_DAYS
+    AUDIT_LOG_RETENTION_DAYS: parsed.AUDIT_LOG_RETENTION_DAYS,
+    TRUST_PROXY: parsed.TRUST_PROXY
   };
+}
+
+function isValidTrustProxyEntry(entry: string): boolean {
+  if (TRUST_PROXY_KEYWORDS.has(entry)) {
+    return true;
+  }
+
+  const [address, prefix, ...rest] = entry.split("/");
+  const family = isIP(address ?? "");
+
+  if (rest.length > 0 || family === 0) {
+    return false;
+  }
+
+  if (prefix === undefined) {
+    return true;
+  }
+
+  return /^\d+$/.test(prefix) && Number(prefix) <= (family === 4 ? 32 : 128);
 }
 
 function parseBooleanFlag(value: string | undefined): boolean {

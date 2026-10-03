@@ -1,0 +1,11 @@
+# Optional Compose override: lets the Gatekeeper container reach services running on the Docker
+# host itself, for example Home Assistant installed on this same server, as
+# http://host.docker.internal:8123 (localhost inside a container is the container, not the host).
+#
+# install.sh enables it automatically, via COMPOSE_FILE in .env, when your Home Assistant URL
+# points at this server. It is kept out of the base stack so that nothing depends on Docker's
+# host-gateway feature unless it is actually needed.
+services:
+  gatekeeper:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

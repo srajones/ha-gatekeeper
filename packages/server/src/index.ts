@@ -13,7 +13,7 @@ import { prisma } from "./db.js";
 import { adminRoutes } from "./admin.js";
 import { publicApiRoutes } from "./publicApi.js";
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: env.TRUST_PROXY });
 
 await app.register(cors, {
   origin: env.CORS_ORIGIN,
