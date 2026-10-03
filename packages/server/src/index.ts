@@ -13,7 +13,11 @@ import { prisma } from "./db.js";
 import { adminRoutes } from "./admin.js";
 import { publicApiRoutes } from "./publicApi.js";
 
-const app = Fastify({ logger: true, trustProxy: env.TRUST_PROXY });
+// Fastify 5 no longer takes a hop count directly; trust the first N addresses from the socket.
+const trustProxy =
+  typeof env.TRUST_PROXY === "number" ? (_address: string, hop: number) => hop < Number(env.TRUST_PROXY) : env.TRUST_PROXY;
+
+const app = Fastify({ logger: true, trustProxy });
 
 await app.register(cors, {
   origin: env.CORS_ORIGIN,

@@ -251,7 +251,7 @@ test("serves an OpenAPI document describing the public routes", async () => {
 });
 
 test("serves the Swagger UI page", async () => {
-  const response = await app.inject({ method: "GET", url: "/api/documentation/static/index.html" });
+  const response = await app.inject({ method: "GET", url: "/api/documentation/" });
 
   assert.equal(response.statusCode, 200);
   assert.match(String(response.headers["content-type"]), /^text\/html/);

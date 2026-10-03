@@ -293,7 +293,8 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         if (haResponse.contentType) {
           reply.header("content-type", haResponse.contentType);
         }
-        return reply.status(haResponse.status).send(haResponse.body);
+        // Home Assistant's status is passed through as-is; Fastify 5 types only the schema's codes.
+        return reply.status(haResponse.status as never).send(haResponse.body as never);
       } catch (err) {
         const message = err instanceof Error ? err.message : "unknown_error";
         await logAudit(request.log, {
@@ -383,7 +384,8 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       if (haResponse.contentType) {
         reply.header("content-type", haResponse.contentType);
       }
-      return reply.status(haResponse.status).send(haResponse.body);
+      // Home Assistant's status is passed through as-is; Fastify 5 types only the schema's codes.
+        return reply.status(haResponse.status as never).send(haResponse.body as never);
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown_error";
       await logAudit(request.log, {
