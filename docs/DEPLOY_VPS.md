@@ -8,6 +8,8 @@ secret, keeps it running, and checks that it all works when it is done. It is sa
 On the server, as root (or with `sudo`):
 
 ```bash
+# minimal Debian/Ubuntu images have no git or curl yet:
+apt-get update && apt-get install -y git curl
 git clone https://github.com/srajones/ha-gatekeeper.git
 cd ha-gatekeeper
 sudo ./install.sh
@@ -102,7 +104,7 @@ is printed once at the end. Every setting is documented in [`deploy/env.example`
 The installer opens ports 80/443 in ufw or firewalld when one is active. If ufw is installed but off, it
 offers to switch it on allowing only your SSH port(s) (read from sshd, so you cannot lock yourself out),
 80 and 443; set `GATEKEEPER_UFW=1` to do that unattended or `GATEKEEPER_UFW=0` to never ask. If Home
-Assistant runs on the same server it also allows the Docker networks to reach that one port. Rules it
+Assistant runs on the same server (or is addressed by the server's own IP or domain) it also allows the Docker networks to reach that one port. Rules it
 adds are removed again when you switch to private mode or uninstall (the SSH rule is never touched).
 Docker bypasses ufw for published ports, so the app's own port stays bound to `127.0.0.1` regardless.
 

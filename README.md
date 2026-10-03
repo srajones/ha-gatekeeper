@@ -36,6 +36,7 @@ Add-on releases use prebuilt GHCR images at `ghcr.io/wookingwoo/ha-gatekeeper`, 
 ## Install on a VPS (one script)
 
 ```bash
+apt-get update && apt-get install -y git   # only needed on minimal Debian/Ubuntu images
 git clone https://github.com/srajones/ha-gatekeeper.git && cd ha-gatekeeper && sudo ./install.sh
 ```
 

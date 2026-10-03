@@ -74,6 +74,16 @@ t "host test reverse" "http://127.0.0.1:8123" "$(ha_url_for_host_test http://hos
 t "host test reverse path" "https://127.0.0.1:8443/ha" "$(ha_url_for_host_test https://host.docker.internal:8443/ha)"
 t "host test passthrough" "https://abc.ui.nabu.casa" "$(ha_url_for_host_test https://abc.ui.nabu.casa)"
 
+echo "host_is_self / ha_local_port"
+myip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -n "$myip" ]]; then
+  host_is_self "$myip" && t "own ip is self" 0 0 || t "own ip is self" 0 1
+  declare -A CFG=([HA_BASE_URL]="http://$myip:8123")
+  t "own ip -> local port" 8123 "$(ha_local_port)"
+fi
+host_is_self 8.8.8.8 && t "foreign ip not self" 1 0 || t "foreign ip not self" 1 1
+host_is_self "" && t "empty not self" 1 0 || t "empty not self" 1 1
+
 echo "token_problem / password_problem"
 GOOD_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhYmMifQ.abcDEF-_123"
 t "good token" "" "$(token_problem "$GOOD_TOKEN")"

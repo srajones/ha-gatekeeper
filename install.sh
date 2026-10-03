@@ -398,6 +398,8 @@ ensure_prereqs() {
   have flock   || need+=(util-linux)
   have tar     || need+=(tar)
   have gzip    || need+=(gzip)
+  # fuser (psmisc) lets the installer tell a busy apt lock from a stale one; minimal images lack it.
+  if [[ "$PKG" == apt ]]; then have fuser || need+=(psmisc); fi
   [[ -e /etc/ssl/certs/ca-certificates.crt || -d /etc/pki/tls/certs || -e /etc/ssl/cert.pem ]] || need+=(ca-certificates)
 
   if (( ${#need[@]} == 0 )); then
@@ -1441,10 +1443,28 @@ ssh_ports() {
   printf '%s' "${ports% }"
 }
 
-# Home Assistant on this same server: the container reaches it through the Docker bridge, which
-# a default-deny host firewall blocks. Allow just that port from the Docker networks.
+# host_is_self HOST -> 0 when HOST is (or resolves to) one of this server's own addresses.
+host_is_self() {
+  local h="$1" a own
+  [[ -n "$h" ]] || return 1
+  own=" $( { hostname -I 2>/dev/null; ip -o addr show 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4}'; } | tr '\n' ' ') "
+  if is_ipv4 "$h"; then
+    [[ "$own" == *" $h "* ]]; return
+  fi
+  [[ "$h" == *.* ]] || return 1
+  while read -r a _; do
+    [[ -n "$a" && "$own" == *" $a "* ]] && return 0
+  done < <(getent ahostsv4 "$h" 2>/dev/null || true)
+  return 1
+}
+
+# Home Assistant on this same server (by localhost or by the server's own address): the container
+# reaches it through the Docker bridge, which a default-deny host firewall blocks. Allow just that
+# port from the Docker networks.
 ha_local_port() {
-  [[ "$(url_host "${CFG[HA_BASE_URL]:-}")" == host.docker.internal ]] || return 1
+  local lh
+  lh="$(url_host "${CFG[HA_BASE_URL]:-}")"
+  [[ "$lh" == host.docker.internal ]] || host_is_self "$lh" || return 1
   local port
   port="$(url_port "${CFG[HA_BASE_URL]}")"
   [[ -n "$port" ]] || { [[ "$(url_scheme "${CFG[HA_BASE_URL]}")" == https ]] && port=443 || port=80; }
@@ -1945,10 +1965,16 @@ verify_ha_from_container() {
     [[ -n "$why" ]] || why="$(head -n 1 "$errf" 2>/dev/null || true)"
     case "$why" in
       ENOTFOUND|EAI_AGAIN) vfail "Container cannot resolve the Home Assistant host ($why)" "Use a name that resolves from the internet, or an IP over a VPN." ;;
-      ECONNREFUSED)        vfail "Home Assistant refused the connection from the container" "Wrong port, or HA only listens on localhost. If HA runs on this server it must listen on 0.0.0.0 and the firewall must allow the Docker network (ufw allow from 172.16.0.0/12 to any port 8123)." ;;
+      ECONNREFUSED)        vfail "Home Assistant refused the connection from the container" "Wrong port, or HA only listens on localhost. If HA runs on this server it must listen on 0.0.0.0 and the host firewall must allow the Docker network (172.16.0.0/12) to that port$(have ufw && echo ', e.g. ufw allow from 172.16.0.0/12 to any port 8123')." ;;
       ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|TimeoutError)
-        if [[ "$(url_host "${CFG[HA_BASE_URL]:-}")" == host.docker.internal ]]; then
-          vfail "Timed out reaching Home Assistant on this server from the container" "A host firewall is probably blocking the Docker network: ufw allow from 172.16.0.0/12 to any port $(ha_local_port || echo 8123) proto tcp (re-running the installer adds this for you)."
+        if ha_local_port >/dev/null 2>&1; then
+          local fwhint
+          if have ufw; then
+            fwhint="ufw allow from 172.16.0.0/12 to any port $(ha_local_port) proto tcp (re-running the installer adds this for you)."
+          else
+            fwhint="allow the Docker networks (172.16.0.0/12) to reach TCP port $(ha_local_port) in your host firewall."
+          fi
+          vfail "Timed out reaching Home Assistant on this server from the container" "A host firewall is probably blocking the Docker network: $fwhint"
         else
           vfail "Timed out reaching Home Assistant from the container" "Home LAN addresses are unreachable from a VPS without a VPN (Tailscale/WireGuard); for a public address check the port is open to this server."
         fi ;;
