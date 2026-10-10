@@ -42,6 +42,13 @@ git clone https://github.com/srajones/ha-gatekeeper.git && cd ha-gatekeeper && s
 
 `install.sh` asks for your Home Assistant URL/token and admin password (secrets are generated), then shows **the complete list of everything it will change on the server and waits for your yes** (`--dry-run` shows the list and stops). After approval it installs Docker only if missing, sets up HTTPS with Caddy (or sits behind the web server you already run), starts everything with automatic restarts and a watchdog, and finishes with a full health check. If anything fails it undoes what it did. Secrets are mounted into the container as read-only files, never as environment variables. Re-run it any time to repair; use `gatekeeper verify|status|logs|update|backup` afterwards. See [docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md).
 
+### Home Assistant stays calm, however many keys you create
+
+One websocket carries every key: Home Assistant pushes only the changes of the entities your keys may read, and
+API reads are answered from memory. How it behaves (live subscription, sharing window, request ceiling, what to do
+when the link drops, per-key rate limit) is chosen in the dashboard under **Settings** and documented in
+[docs/HOME_ASSISTANT_CONNECTION.md](docs/HOME_ASSISTANT_CONNECTION.md).
+
 ## Local Development
 
 1. Install dependencies.

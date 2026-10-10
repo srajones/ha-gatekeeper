@@ -90,11 +90,11 @@ no secret appears in the container environment. `sudo ./install.sh secrets` rewr
 
 ## Home Assistant is protected from the number of keys
 
-Every API key shares one gate to Home Assistant: state reads are cached for 2 seconds and identical simultaneous
-reads share a single request (so 100 keys reading the same entity cost Home Assistant one request); at most 8
-requests are in flight at once, with a bounded queue, and when it is full callers get `503 ha_busy`
-(`Retry-After: 1`) instead of piling more onto Home Assistant. A service call clears the cache so the next read
-shows its effect. Tunable with `HA_STATE_CACHE_MS` (0 = off) and `HA_MAX_CONCURRENCY` in `.env`.
+ha-gatekeeper keeps **one** websocket to Home Assistant for all keys and answers state reads from memory, so 100 keys
+cost Home Assistant the same as one. Service calls share a gate with a hard ceiling on simultaneous requests. You
+choose the behaviour in the dashboard (Settings) and everything is explained, with the failure behaviour, in
+[HOME_ASSISTANT_CONNECTION.md](HOME_ASSISTANT_CONNECTION.md). `HA_STATE_CACHE_MS` and `HA_MAX_CONCURRENCY` in `.env`
+only set the starting values.
 
 ## What keeps it alive
 
