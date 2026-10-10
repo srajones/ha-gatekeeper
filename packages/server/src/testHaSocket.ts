@@ -67,8 +67,8 @@ export class FakeHaServer {
     this.server.on("upgrade", (req, socket) => this.upgrade(req, socket));
   }
 
-  async listen(): Promise<number> {
-    await new Promise<void>((resolve) => this.server.listen(0, "127.0.0.1", resolve));
+  async listen(port = 0, host = "127.0.0.1"): Promise<number> {
+    await new Promise<void>((resolve) => this.server.listen(port, host, resolve));
     return (this.server.address() as { port: number }).port;
   }
 

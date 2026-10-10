@@ -2736,6 +2736,37 @@ verify_behind_proxy() {
   fi
 }
 
+# The server keeps one websocket to Home Assistant for all API keys (see docs/HOME_ASSISTANT_CONNECTION.md).
+verify_live_connection() {
+  http_do GET "$FD_BASE/admin/connection" "" "${FD_ARGS[@]}" || true
+  if [[ "$LAST_CODE" != 200 ]]; then
+    vwarn "Could not read the Home Assistant connection status (HTTP ${LAST_CODE:-none})" "gatekeeper logs"
+    return 0
+  fi
+  local source running connected watched i
+  source="$(jq -r '.settings.stateSource // empty' <<<"$LAST_BODY" 2>/dev/null || true)"
+  if [[ "$source" != subscription ]]; then
+    vpass "Live subscription is switched off in Settings (reads ask Home Assistant, shared briefly)"
+    return 0
+  fi
+  # A freshly started server needs a moment to open the websocket.
+  for i in 1 2 3 4 5 6; do
+    running="$(jq -r '.live.running' <<<"$LAST_BODY" 2>/dev/null || echo false)"
+    connected="$(jq -r '.live.connected' <<<"$LAST_BODY" 2>/dev/null || echo false)"
+    watched="$(jq -r '.live.subscribed' <<<"$LAST_BODY" 2>/dev/null || echo 0)"
+    if [[ "$connected" == true ]] || { [[ "$running" == true ]] && [[ "$watched" == 0 ]]; }; then break; fi
+    sleep 2
+    http_do GET "$FD_BASE/admin/connection" "" "${FD_ARGS[@]}" || true
+  done
+  if [[ "$connected" == true ]]; then
+    vpass "One live websocket to Home Assistant is up ($watched entities watched; API reads never reach Home Assistant)"
+  elif [[ "$running" == true && "$watched" == 0 ]]; then
+    vpass "Live subscription is ready: no API key can read an entity yet, so nothing is watched (and no traffic is sent)"
+  else
+    vwarn "The live websocket to Home Assistant is not up ($(jq -r '.live.lastError // "still connecting"' <<<"$LAST_BODY" 2>/dev/null))" "Reads fall back to asking Home Assistant, so nothing breaks. gatekeeper logs"
+  fi
+}
+
 verify_app() {
   vsection "Application"
   local base code t
@@ -2797,6 +2828,7 @@ verify_app() {
   HTTP_COOKIE="$saved_cookie"
 
   verify_ha_from_container
+  verify_live_connection
 
   http_do GET "$FD_BASE/admin/ha/entities" "" "${FD_ARGS[@]}" || true
   local count entity other
