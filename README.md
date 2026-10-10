@@ -11,6 +11,8 @@ A single-container API gateway for Home Assistant that issues limited, audited b
 - Quick Start admin flow for creating scoped access without manual policy setup
 - Audit log storage and query
 - Admin dashboard with session login
+- One live websocket to Home Assistant for all keys (answers from memory, minimal load), with behaviour chosen in the dashboard Settings
+- Secrets mounted as files, never as container environment variables (VPS installer)
 - Single-container deployment
 
 ## Screenshots
