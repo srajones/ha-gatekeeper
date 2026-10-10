@@ -28,6 +28,15 @@ curl -fsSL https://raw.githubusercontent.com/srajones/ha-gatekeeper/main/install
 # another branch or fork:  ... | sudo GK_BRANCH=my-branch GK_REPO_URL=https://github.com/me/ha-gatekeeper.git bash
 ```
 
+**Run it inside `tmux` or `screen`** (`apt-get install -y tmux && tmux`, then run the installer; reattach with
+`tmux attach`). If your SSH connection drops mid-install the installer rolls everything back safely (the log says
+why: "SIGHUP: the terminal or SSH session closed"), but you would have to start over; inside tmux the install
+simply keeps going.
+
+Installing packages never restarts your services: the installer sets `NEEDRESTART_MODE=l` (list only) and
+`DEBIAN_FRONTEND=noninteractive`, so Ubuntu's "restart services?" screen cannot stop it and your other apps are
+not interrupted. If the server has a reboot pending, the end-of-run summary says so.
+
 Supported: Ubuntu, Debian, and RHEL-family servers (Docker and every other dependency are
 installed for you). Other Linux distributions work if Docker with Compose v2 is already installed.
 
@@ -67,7 +76,11 @@ only works over HTTPS (or `localhost`). That is why the installer sets up Caddy 
    are never removed. A firewall that was already on is never turned off; a firewall this run switched on is
    switched off again (before its rules are removed, so there is no lock-out). A re-run over a working
    installation restores the previous `.env` and restarts the previous settings. `--keep-on-failure` keeps a
-   failed install for debugging. The only failure that does not undo the install is "the HTTPS certificate
+   failed install for debugging. The rollback prints its cause (error, Ctrl-C, SIGHUP/closed SSH session...)
+   and keeps the install log for you. If Docker was stopped and you allowed the installer to start it
+   (`GATEKEEPER_START_DOCKER=1`), a later failure leaves Docker running, because stopping it would stop your
+   other containers again. Docker's own installer may upgrade `curl` and `ca-certificates` (ordinary security
+   updates); a rollback does not downgrade them, and the plan and summary say so. The only failure that does not undo the install is "the HTTPS certificate
    is not issued yet" (Caddy keeps retrying by itself).
 4. **A summary at the end** lists every change that was made outside the app folder.
 5. **What `gatekeeper uninstall` does not undo:** Docker and any packages installed for you, the swap file and
@@ -173,6 +186,9 @@ In HTTPS modes the installer adds the rules for ports 80/443 to ufw or firewalld
 on allowing only your SSH port(s) (read from sshd, so you cannot lock yourself out), 80 and 443; the default
 answer is No and `--yes` alone never turns a firewall on: use `GATEKEEPER_UFW=1`. **`GATEKEEPER_UFW=0` means the
 installer never touches the firewall at all** (no switching on, no rules; it prints the rules you may need).
+If Home Assistant runs on this same server, ufw is active and you set `GATEKEEPER_UFW=0`, the installer stops
+**before changing anything** unless a rule already lets the Docker networks reach Home Assistant, and prints
+the one command to run: `ufw allow from 172.16.0.0/12 to any port 8123 proto tcp` (your HA port).
 Private mode opens no ports. If Home
 Assistant runs on the same server (or is addressed by the server's own IP or domain) it also allows the Docker networks to reach that one port. Rules it
 adds are removed again when you switch to private mode or uninstall (the SSH rule is never touched).

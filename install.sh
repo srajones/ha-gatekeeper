@@ -131,7 +131,7 @@ info()  { $QUIET || printf '%s[ .. ]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; log_file
 ok()    { $QUIET || printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; log_file "OK    $*"; }
 warn()  { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; log_file "WARN  $*"; }
 err()   { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; log_file "ERROR $*"; }
-die()   { err "$*"; exit 1; }
+die()   { err "$*"; [[ -n "${ROLLBACK_CAUSE:-}" ]] || ROLLBACK_CAUSE="stopped: $*"; exit 1; }
 
 hint() { # indented, dim follow-up line
   $QUIET || printf '       %s%s%s\n' "$C_DIM" "$*" "$C_RESET"
@@ -201,6 +201,7 @@ on_error() {
   [[ "$BASHPID" == "$MAIN_PID" ]] || return 0
   trap - ERR
   err "Stopped unexpectedly (exit code $rc, line $line)."
+  ROLLBACK_CAUSE="error: exit code $rc at install.sh line $line"
   if $INSTALL_ACTIVE && ! $KEEP_ON_FAILURE; then
     hint "This run's changes are being undone now, so it is safe to run the installer again."
   else
@@ -272,6 +273,7 @@ JOURNAL_LOG=""         # append-only text copy, written once the plan is approve
 JOURNAL_TMP=""         # scratch folder for the files we back up before replacing them
 INSTALL_ACTIVE=false   # true from the start of an install until it is committed
 ROLLING_BACK=false
+ROLLBACK_CAUSE=""       # why a rollback started (shown and logged)
 RV_NOTE=""
 
 journal_tmp() {
@@ -355,7 +357,7 @@ rv_rmtree() {
   rm -rf -- "$p"
 }
 
-rv_daemon_reload() { have_systemd && systemctl daemon-reload; return 0; }
+rv_daemon_reload() { have_systemd && { systemctl daemon-reload; systemctl reset-failed 'ha-gatekeeper*' 2>/dev/null; }; return 0; }
 
 rv_unit_disable() {
   have_systemd || return 0
@@ -426,8 +428,8 @@ rv_pkgs_since() {
 
 # Docker Engine installed by this run: its packages, the repository definition the Docker
 # installer added, and (only if they did not exist before) its data folders.
-rv_docker_engine() { # rv_docker_engine PKG_SNAPSHOT FILES_BEFORE HAD_DOCKER_DIR HAD_CONTAINERD_DIR
-  local snap="$1" before="$2" had_d="$3" had_c="$4" f rc=0
+rv_docker_engine() { # rv_docker_engine PKG_SNAPSHOT FILES_BEFORE HAD_DOCKER_DIR HAD_CONTAINERD_DIR HAD_GROUP HAD_OPT_CONTAINERD
+  local snap="$1" before="$2" had_d="$3" had_c="$4" had_g="${5:-1}" had_o="${6:-1}" f rc=0
   rv_pkgs_since "$snap" || rc=$?
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
@@ -437,6 +439,18 @@ rv_docker_engine() { # rv_docker_engine PKG_SNAPSHOT FILES_BEFORE HAD_DOCKER_DIR
   if (( rc == 0 )); then
     [[ "$had_d" == 0 ]] && rm -rf /var/lib/docker
     [[ "$had_c" == 0 ]] && rm -rf /var/lib/containerd
+    # Leftovers the package removal does not clean up: the docker group (only if this run's
+    # packages created it), empty /opt/containerd folders, a socket file nobody listens on.
+    if [[ "$had_g" == 0 ]] && getent group docker >/dev/null 2>&1 && [[ -z "$(getent group docker | cut -d: -f4)" ]]; then
+      groupdel docker >/dev/null 2>&1 || true
+    fi
+    if [[ "$had_o" == 0 ]]; then
+      rmdir /opt/containerd/bin /opt/containerd/lib /opt/containerd 2>/dev/null || true
+    fi
+    if [[ -S /var/run/docker.sock ]] && ! { have_systemd && systemctl is-active --quiet docker.socket docker.service 2>/dev/null; }; then
+      rm -f /var/run/docker.sock
+    fi
+    have_systemd && systemctl daemon-reload >/dev/null 2>&1
   fi
   return "$rc"
 }
@@ -503,6 +517,7 @@ journal_rollback() { # journal_rollback [quiet]
   (( ${#J_DESC[@]} > 0 )) || return 0
   ROLLING_BACK=true
   trap - ERR
+  local cause="${ROLLBACK_CAUSE:-}"
   # A dropped SSH session must not interrupt the undo: ignore the hang-up, and a closed terminal
   # (broken pipe on output) must not kill it either; everything is also written to the log.
   trap '' INT TERM HUP PIPE
@@ -513,7 +528,8 @@ journal_rollback() { # journal_rollback [quiet]
     printf '\n%s%sUndoing what this installation changed (newest first)%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
     printf '%sAnything that was already on this server is left alone.%s\n' "$C_DIM" "$C_RESET"
   fi
-  log_file "ROLLBACK started with ${#J_DESC[@]} entries"
+  log_file "ROLLBACK started with ${#J_DESC[@]} entries${cause:+ (cause: $cause)}"
+  [[ "$quiet" == quiet || -z "$cause" ]] || printf '%sCause: %s%s\n' "$C_DIM" "$cause" "$C_RESET"
   if [[ "$quiet" != quiet && -d "$STATE_DIR" && ! -e "$STATE_DIR/paused" ]]; then
     pause_watchdog 900 >/dev/null 2>&1 && paused=true
   fi
@@ -544,6 +560,7 @@ journal_rollback() { # journal_rollback [quiet]
     else
       printf '\n%s%s%s step(s) could not be undone automatically (listed above). Install log: %s%s\n' "$C_BOLD" "$C_RED" "$failed" "${REAL_LOG_FILE:-$LOG_FILE}" "$C_RESET"
     fi
+    printf '%sKept for you, on purpose: the install log %s (what happened and why).%s\n' "$C_DIM" "${REAL_LOG_FILE:-$LOG_FILE}" "$C_RESET"
   fi
   return "$failed"
 }
@@ -1630,7 +1647,7 @@ decide_docker_start() {
 }
 
 install_docker() {
-  local script snap before had_d=0 had_c=0
+  local script snap before had_d=0 had_c=0 had_g=0 had_o=0
   script="$(mktemp_tracked)"
   info "Installing Docker Engine (official installer from get.docker.com)"
   if ! retry 3 5 curl -fsSL --connect-timeout 10 --max-time 90 https://get.docker.com -o "$script"; then
@@ -1639,11 +1656,13 @@ install_docker() {
   fi
   [[ -d /var/lib/docker ]] && had_d=1
   [[ -d /var/lib/containerd ]] && had_c=1
+  getent group docker >/dev/null 2>&1 && had_g=1
+  [[ -d /opt/containerd ]] && had_o=1
   snap="$(journal_tmp)/pkgs.docker"
   before="$(journal_tmp)/files.docker"
   pkg_snapshot "$snap" || : >"$snap"
   find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/yum.repos.d -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort >"$before" || true
-  J_KEEP_NEXT=1 jpush "Installed Docker Engine (docker-ce, containerd and the Compose plugin, from get.docker.com)" rv_docker_engine "$snap" "$before" "$had_d" "$had_c"
+  J_KEEP_NEXT=1 jpush "Installed Docker Engine (docker-ce, containerd and the Compose plugin, from get.docker.com)" rv_docker_engine "$snap" "$before" "$had_d" "$had_c" "$had_g" "$had_o"
   wait_for_apt_lock
   apt_lock_conf_on
   if run_logged "Running the Docker installer (takes a minute or two)" sh "$script"; then
@@ -2686,7 +2705,8 @@ verify_ha_from_container() {
         if ha_local_port >/dev/null 2>&1; then
           local fwhint
           if have ufw; then
-            fwhint="ufw allow from 172.16.0.0/12 to any port $(ha_local_port) proto tcp (re-running the installer adds this for you)."
+            fwhint="ufw allow from 172.16.0.0/12 to any port $(ha_local_port) proto tcp"
+            [[ "${GATEKEEPER_UFW:-}" == 0 ]] || fwhint+=" (re-running the installer adds this for you)."
           else
             fwhint="allow the Docker networks (172.16.0.0/12) to reach TCP port $(ha_local_port) in your host firewall."
           fi
@@ -3365,7 +3385,7 @@ wizard_mode() {
 # Private mode: an HTTPS web server you already run (nginx, Apache, Traefik...) may forward to us.
 wizard_behind_proxy() {
   local v cur="${CFG[GATEKEEPER_PUBLIC_URL]:-}"
-  [[ "$cur" == https://* ]] || cur=""
+  [[ "$cur" == https://* && "${WIZ_PREV_MODE:-}" == local ]] || cur=""
   say ""
   say "${C_BOLD}Do you already run a web server with HTTPS in front of this (nginx, Apache, Traefik...)?${C_RESET}"
   say "  ${C_DIM}If yes, enter the public address it uses, for example https://ha.example.com. I will not touch that server;${C_RESET}"
@@ -3614,6 +3634,9 @@ mask() {
 }
 
 run_wizard() {
+  # The address offered in "behind your own web server" comes only from an earlier run in that
+  # same mode; a https://<server IP> left over from "self-signed" mode is not a web server of yours.
+  WIZ_PREV_MODE="${CFG[GATEKEEPER_MODE]:-}"
   wizard_mode
   case "${CFG[GATEKEEPER_MODE]}" in
     domain) wizard_domain ;;
@@ -3878,6 +3901,32 @@ decide_changes() {
   check_container_conflicts
   pick_app_port
   check_web_ports || die "Nothing was changed."
+  check_local_ha_firewall || die "Nothing was changed."
+}
+
+# Home Assistant on this very server, an active firewall, and the installer told not to touch it:
+# the container could never reach Home Assistant, so the final check would fail after a long build.
+# Say so now, before anything is changed, with the exact command to run.
+check_local_ha_firewall() {
+  local hp
+  hp="$(ha_local_port || true)"
+  [[ -n "$hp" && "${GATEKEEPER_UFW:-}" == 0 ]] || return 0
+  if ufw_active; then
+    ufw_has_rule "allow from 172.16.0.0/12 to any port $hp proto tcp" && return 0
+    ufw_has_rule "allow $hp/tcp" && return 0
+    ufw_has_rule "allow $hp" && return 0
+    err "Home Assistant runs on this server (port $hp) and the ufw firewall is active, but GATEKEEPER_UFW=0 tells the installer not to touch the firewall."
+    say "  Gatekeeper runs in a container; ufw would block it from reaching Home Assistant."
+    say "  Allow the Docker networks to reach that one port, then run the installer again:"
+    say "      ufw allow from 172.16.0.0/12 to any port $hp proto tcp"
+    say "  (or run without GATEKEEPER_UFW=0 and the installer adds exactly that rule, and removes it again on rollback)."
+    return 1
+  fi
+  if firewalld_active; then
+    warn "Home Assistant runs on this server (port $hp) and firewalld is active. GATEKEEPER_UFW=0 means the installer will not change it."
+    say "  If the final check cannot reach Home Assistant, allow the Docker networks (172.16.0.0/12) to reach TCP port $hp."
+  fi
+  return 0
 }
 
 PLAN_SOFTWARE=(); PLAN_SYSTEM=(); PLAN_NETWORK=(); PLAN_APPDIR=(); PLAN_KEEP=()
@@ -3893,8 +3942,8 @@ build_plan() {
     PLAN_KEEP+=("The tools the installer needs (curl, git, jq, openssl...) are already installed: no packages are added")
   fi
   case "$P_DOCKER" in
-    install) PLAN_SOFTWARE+=("Install Docker Engine with Docker's official script (get.docker.com): adds Docker's package repository, installs docker-ce, containerd and the Compose plugin, enables Docker at boot and starts it") ;;
-    start)   PLAN_SOFTWARE+=("START the Docker service. It is installed but stopped, and starting it also starts every other container on this server that has a restart policy") ;;
+    install) PLAN_SOFTWARE+=("Install Docker Engine with Docker's official script (get.docker.com): adds Docker's package repository, installs docker-ce, containerd and the Compose plugin, enables Docker at boot and starts it. That script may also upgrade curl and ca-certificates (ordinary security updates; a rollback does not downgrade them)") ;;
+    start)   PLAN_SOFTWARE+=("START the Docker service. It is installed but stopped, and starting it also starts every other container on this server that has a restart policy. If the install later fails, Docker is left running (stopping it would stop your other containers again)") ;;
     ok)      PLAN_KEEP+=("Docker ($(docker --version 2>/dev/null | head -n 1)) is already installed and running: it is not reinstalled, upgraded or restarted") ;;
   esac
   if [[ "$P_DOCKER" != install ]] && $P_COMPOSE_NEEDED; then
@@ -4077,7 +4126,13 @@ print_changes_summary() {
     say "   * $line"
   done < <(journal_list keep-only)
   say "   * base Docker images that were downloaded, and Docker's build cache (docker image prune / docker builder prune)"
+  [[ "${P_DOCKER:-}" != install ]] || say "   * curl / ca-certificates, if Docker's installer upgraded them (ordinary security updates)"
   say "   * the code in $APP_DIR, the backups in $APP_DIR/backups and the log $REAL_LOG_FILE"
+  if [[ -e /var/run/reboot-required ]]; then
+    say ""
+    say "  ${C_YELLOW}Note:${C_RESET} this server has a reboot pending (/var/run/reboot-required, usually a kernel or library update)."
+    say "  The installer did not restart anything for it. Reboot when it suits you: Gatekeeper comes back by itself."
+  fi
 }
 
 cmd_install() {
@@ -4497,11 +4552,13 @@ cmd_uninstall() {
 
   if have_systemd; then
     systemctl disable --now ha-gatekeeper-watchdog.timer ha-gatekeeper-backup.timer >>"$LOG_FILE" 2>&1 || true
-    systemctl disable ha-gatekeeper.service >>"$LOG_FILE" 2>&1 || true
+    # --now: the boot unit is a oneshot that stays "active" after start; stop it so nothing is left running
+    systemctl disable --now ha-gatekeeper.service >>"$LOG_FILE" 2>&1 || true
     rm -f "$SYSTEMD_DIR"/ha-gatekeeper.service "$SYSTEMD_DIR"/ha-gatekeeper-watchdog.service \
       "$SYSTEMD_DIR"/ha-gatekeeper-watchdog.timer "$SYSTEMD_DIR"/ha-gatekeeper-backup.service \
       "$SYSTEMD_DIR"/ha-gatekeeper-backup.timer
     systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+    systemctl reset-failed 'ha-gatekeeper*' >>"$LOG_FILE" 2>&1 || true
     ok "Removed the systemd units"
   fi
   rm -f "$CRON_FILE"
@@ -4742,7 +4799,9 @@ main() {
 
   ensure_root
   # Never let a package prompt (needrestart, debconf, config-file questions) stop an unattended run.
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+  # NEEDRESTART_MODE=l only LISTS services that need a restart; it never restarts one (a restart
+  # could interrupt your other apps), and NEEDRESTART_SUSPEND=1 silences its prompt entirely.
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1
   detect_os
   init_logging
   if ! have_tty && ! $NON_INTERACTIVE; then
@@ -4752,9 +4811,9 @@ main() {
 
   trap cleanup EXIT
   trap 'on_error $? $LINENO' ERR
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
+  trap 'ROLLBACK_CAUSE="interrupted with Ctrl-C (SIGINT)"; exit 130' INT
+  trap 'ROLLBACK_CAUSE="stopped by SIGTERM (something asked the installer to stop)"; exit 143' TERM
+  trap 'ROLLBACK_CAUSE="SIGHUP: the terminal or SSH session closed"; exit 129' HUP
 
   # Created here, in the main shell (a first call inside $(...) would be lost).
   [[ "$COMMAND" == install ]] && journal_tmp >/dev/null

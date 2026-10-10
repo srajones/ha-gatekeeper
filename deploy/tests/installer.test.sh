@@ -144,7 +144,11 @@ h="$(gen_hash_secret)"; t "hash secret length >= 16" yes "$([[ ${#h} -ge 16 ]] &
 [[ "$h" =~ ^[A-Za-z0-9_-]+$ ]] && pass=$((pass+1)) || { failn=$((failn+1)); echo "  FAIL: hash secret has unsafe chars: $h"; }
 for len in 8 12 24 40; do a="$(gen_alnum $len)"; t "gen_alnum $len length" "$len" "${#a}"; [[ "$a" =~ ^[A-Za-z0-9]+$ ]] || { failn=$((failn+1)); echo "  FAIL: gen_alnum non-alnum: $a"; }; done
 # node's base64 decoder must also give 32 bytes for the session secret (that is how the app reads it)
-nbytes="$(node -e 'console.log(Buffer.from(process.argv[1],"base64").length)' "$s1")"; t "node decodes session secret to 32 bytes" 32 "$nbytes"
+if command -v node >/dev/null 2>&1; then
+  nbytes="$(node -e 'console.log(Buffer.from(process.argv[1],"base64").length)' "$s1")"; t "node decodes session secret to 32 bytes" 32 "$nbytes"
+else
+  echo "  SKIP: node decodes session secret (node is not installed here; this one check needs it)"
+fi
 
 echo; echo "RESULT: $pass passed, $failn failed"
 [[ $failn -eq 0 ]]

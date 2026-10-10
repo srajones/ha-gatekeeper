@@ -438,6 +438,69 @@ ck "a held lock is detected" out_has "held-detected"
 ck "an unlocked file is not reported as held" out_has "free-detected"
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
+# ============================================================================ local HA + firewall (O1)
+echo "Home Assistant on this server + active ufw + GATEKEEPER_UFW=0 is refused BEFORE anything changes"
+run_case localha_block '
+  touch "$FAKE/ufw.active"; : >"$FAKE/ufw.rules"
+  CFG[HA_BASE_URL]="http://host.docker.internal:8123"
+  export GATEKEEPER_UFW=0
+  check_local_ha_firewall && echo allowed || echo refused
+'
+ck "refused" out_has "refused"
+ck "names the exact ufw command" out_has "ufw allow from 172.16.0.0/12 to any port 8123 proto tcp"
+run_case localha_covered '
+  touch "$FAKE/ufw.active"; echo "allow from 172.16.0.0/12 to any port 8123 proto tcp" >"$FAKE/ufw.rules"
+  CFG[HA_BASE_URL]="http://host.docker.internal:8123"
+  export GATEKEEPER_UFW=0
+  check_local_ha_firewall && echo allowed || echo refused
+'
+ck "allowed when a covering rule exists" out_has "allowed"
+run_case localha_remote '
+  touch "$FAKE/ufw.active"; : >"$FAKE/ufw.rules"
+  CFG[HA_BASE_URL]="https://ha.example.com"
+  export GATEKEEPER_UFW=0
+  check_local_ha_firewall && echo allowed || echo refused
+'
+ck "a remote Home Assistant is never blocked by this check" out_has "allowed"
+
+# ===================================================================== rollback cause + log note (O4, O9)
+echo "a rollback says why it started and that the log is kept"
+run_case cause '
+  ROLLBACK_CAUSE="SIGHUP: the terminal or SSH session closed"
+  mkdir -p "$T/made"; : >"$T/jx"
+  jpush "Created a folder" rv_rm_path "$T/made"
+  journal_rollback
+'
+ck "cause printed" out_has "Cause: SIGHUP: the terminal or SSH session closed"
+ck "cause logged" grep -q "ROLLBACK started with 1 entries (cause: SIGHUP" "$T/install.log"
+ck "log kept note" out_has "Kept for you, on purpose: the install log"
+
+# ================================================================== Docker Engine leftovers (O2)
+echo "undoing Docker Engine also removes what the packages leave behind, only if this run created it"
+cat >"$SHIM/getent" <<'EOF'
+#!/usr/bin/env bash
+echo "getent $*" >>"$FAKE/calls"
+[[ "$1" == group && "$2" == docker && -f "$FAKE/docker.group" ]] && { echo "docker:x:998:"; exit 0; }
+exit 2
+EOF
+cat >"$SHIM/groupdel" <<'EOF'
+#!/usr/bin/env bash
+echo "groupdel $*" >>"$FAKE/calls"; rm -f "$FAKE/docker.group"
+EOF
+chmod +x "$SHIM/getent" "$SHIM/groupdel"
+run_case dockerleft '
+  touch "$FAKE/docker.group";   echo bash >"$FAKE/pkgs"; echo bash >"$T/snap"; : >"$T/before"
+  rv_docker_engine "$T/snap" "$T/before" 0 0 0 1 || true
+  echo "rc=$?"
+'
+ck "docker group created by this run is removed" calls_have "groupdel docker"
+run_case dockerkeep '
+  touch "$FAKE/docker.group"
+  echo bash >"$FAKE/pkgs"; echo bash >"$T/snap"; : >"$T/before"
+  rv_docker_engine "$T/snap" "$T/before" 0 0 1 1 || true
+'
+ck "a docker group that existed before is kept" calls_lack "groupdel"
+
 echo
 echo "RESULT: $pass passed, $failn failed"
 (( failn == 0 ))

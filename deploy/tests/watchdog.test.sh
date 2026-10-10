@@ -2,6 +2,11 @@
 # Offline tests for deploy/watchdog.sh with a shimmed docker (needs node for two tiny fake servers). Run: bash deploy/tests/watchdog.test.sh
 # Deterministic watchdog logic tests using shimmed docker/systemctl/service and fake HTTP servers.
 # Scratch-only, not part of the repo.
+if ! command -v node >/dev/null 2>&1; then
+  echo "SKIPPED: these tests need node (for the two tiny fake HTTP servers) and it is not installed here."
+  echo "         Install node (apt install nodejs) to run them. Nothing was tested."
+  exit 0
+fi
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; SCR="$(mktemp -d)"
 T=$SCR/shimtest; rm -rf "$T"; mkdir -p "$T/bin" "$T/app" "$T/state"
 WD="$REPO"/deploy/watchdog.sh
@@ -158,3 +163,4 @@ mv "$T/app/.env.bak" "$T/app/.env"
 
 pkill -f "servers.mjs $T" 2>/dev/null
 echo; echo "RESULT: $pass passed, $failn failed"
+[[ $failn -eq 0 ]]
