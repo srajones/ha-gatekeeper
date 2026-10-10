@@ -23,7 +23,11 @@ export const settingsSchema = z.object({
   //   error                 503 ha_unavailable
   onLinkDown: z.enum(["live-then-last-known", "last-known", "error"]),
   // Requests per minute allowed for each API key.
-  rateLimitPerMinute: z.number().int().min(1).max(10_000)
+  rateLimitPerMinute: z.number().int().min(1).max(10_000),
+  // Alerts (e-mail, webhook, ntfy, Telegram; set up with `gatekeeper alerts`): how long Home Assistant must be
+  // unreachable before the first message, and how often a reminder follows while it still is (0 = never).
+  alertDownAfterSeconds: z.number().int().min(30).max(3600),
+  alertReminderMinutes: z.number().int().min(0).max(10_080)
 });
 
 export type GatewaySettings = z.infer<typeof settingsSchema>;
@@ -37,7 +41,9 @@ export function defaultSettings(): GatewaySettings {
     cacheMs: env.HA_STATE_CACHE_MS,
     maxConcurrency: env.HA_MAX_CONCURRENCY,
     onLinkDown: "live-then-last-known",
-    rateLimitPerMinute: 100
+    rateLimitPerMinute: 100,
+    alertDownAfterSeconds: 120,
+    alertReminderMinutes: 360
   };
 }
 
@@ -218,5 +224,24 @@ export const SETTINGS_HELP: SettingHelp[] = [
     unit: "requests per minute",
     min: 1,
     max: 10000
+  },
+  {
+    key: "alertDownAfterSeconds",
+    label: "Alert me when Home Assistant has been unreachable for",
+    summary: "How long the connection to Home Assistant must stay down before the first alert is sent.",
+    detail:
+      "Home Assistant restarts and WiFi blips are normal, so a short outage sends nothing. Alerts go to every channel set up on the server (e-mail, webhook, ntfy, Telegram: run 'sudo gatekeeper alerts'). One message when it goes down, one when it is back.",
+    unit: "seconds",
+    min: 30,
+    max: 3600
+  },
+  {
+    key: "alertReminderMinutes",
+    label: "Remind me while it is still down, every",
+    summary: "How often a reminder follows the first alert while Home Assistant is still unreachable.",
+    detail: "0 sends no reminders: you get the 'down' message and the 'back' message only.",
+    unit: "minutes",
+    min: 0,
+    max: 10080
   }
 ];

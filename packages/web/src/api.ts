@@ -64,6 +64,8 @@ export type GatewaySettings = {
   maxConcurrency: number;
   onLinkDown: "live-then-last-known" | "last-known" | "error";
   rateLimitPerMinute: number;
+  alertDownAfterSeconds: number;
+  alertReminderMinutes: number;
 };
 
 export type SettingHelp = {
@@ -87,6 +89,15 @@ export type TwoFactorSetup = {
   secret: string;
   otpauthUri: string;
   issuer: string;
+};
+
+export type AlertChannel = { name: "email" | "webhook" | "ntfy" | "telegram"; configured: boolean; target: string; problem?: string };
+export type AlertResult = { channel: AlertChannel["name"]; ok: boolean; error?: string };
+export type AlertsView = {
+  hostLabel: string;
+  channels: AlertChannel[];
+  state: { haDown: boolean; downSince: string | null; alerted: boolean };
+  history: Array<{ at: string; kind: "down" | "reminder" | "recovered" | "test"; results: AlertResult[] }>;
 };
 
 export type ConnectionStatus = {
@@ -224,6 +235,8 @@ export const api = {
     }),
   resetSettings: () => apiFetch<{ settings: GatewaySettings }>("/admin/settings/reset", { method: "POST" }),
   connection: () => apiFetch<ConnectionStatus>("/admin/connection"),
+  alerts: () => apiFetch<AlertsView>("/admin/alerts"),
+  testAlert: () => apiFetch<{ results: AlertResult[] }>("/admin/alerts/test", { method: "POST" }),
   auditLogs: () => apiFetch<{ logs: AuditLog[] }>("/admin/audit-logs"),
   haServices: () => apiFetch<{ services: HaServiceCatalog[]; cached?: boolean }>(
     "/admin/ha/services"

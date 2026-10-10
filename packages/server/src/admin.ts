@@ -20,6 +20,8 @@ import { isAdminAuthenticated, isAdminLoginAllowed, isTrustedIngressRequest } fr
 import { logAudit } from "./audit.js";
 import { rateLimitErrorResponseBuilder } from "./rateLimit.js";
 import { loadTotpState, registerTotpRoutes } from "./adminTotp.js";
+import { getAlertConfig } from "./alertConfig.js";
+import { alertManager, sendTestAlert } from "./haMonitor.js";
 
 function sendUnauthorized(reply: FastifyReply) {
   return reply.status(401).send({ ok: false, error: "unauthorized" });
@@ -449,6 +451,41 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       return;
     }
     return reply.send({ ok: true, ...gatewayStatus() });
+  });
+
+  // Which alert channels exist (never their secrets) and what was sent recently.
+  app.get("/alerts", async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    const config = getAlertConfig();
+    return reply.send({
+      ok: true,
+      hostLabel: config.hostLabel,
+      channels: config.channels,
+      state: alertManager.status(),
+      history: alertManager.history
+    });
+  });
+
+  app.post("/alerts/test", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    const config = getAlertConfig();
+    if (!config.channels.some((c) => c.configured)) {
+      return reply.status(409).send({ ok: false, error: "no_channels" });
+    }
+    const results = await sendTestAlert();
+    await logAudit(request.log, {
+      clientId: null,
+      permissionId: null,
+      actionIdRaw: "admin.alerts.test",
+      ip: request.ip ?? null,
+      success: results.every((r) => r.ok),
+      error: results.filter((r) => !r.ok).map((r) => r.channel).join(",") || null
+    });
+    return reply.send({ ok: true, results });
   });
 
   app.delete("/clients/:id", async (request, reply) => {

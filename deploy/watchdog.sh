@@ -70,11 +70,22 @@ sset() { printf '%s' "$2" >"$STATE_DIR/$1" 2>/dev/null || true; }
 
 sdel() { rm -f "$STATE_DIR/$1" 2>/dev/null || true; }
 
+# Every configured channel (webhook, ntfy, Telegram, e-mail), each tried on its own.
 alert() {
+  local label
+  label="$(env_file_get "$APP_DIR/.env" ALERT_NAME 2>/dev/null || true)"
+  send_alert_all "$APP_DIR/.env" "${label:-$HOSTNAME_LABEL}" "$*" || log "alert delivery failed on every channel"
+}
+
+# Dead-man's switch for the case where this whole server dies and nobody is left to send an alert: with
+# HEARTBEAT_URL set (healthchecks.io, Uptime Kuma "push", Better Stack ... ) it is called after every run in
+# which nothing is failing, and the external service alerts you when the calls stop.
+heartbeat() {
   local url
-  url="$(env_file_get "$APP_DIR/.env" ALERT_WEBHOOK_URL 2>/dev/null || true)"
+  url="$(env_file_get "$APP_DIR/.env" HEARTBEAT_URL 2>/dev/null || true)"
   [[ -n "$url" ]] || return 0
-  send_webhook "$url" "[HA Gatekeeper @ ${HOSTNAME_LABEL}] $*" >/dev/null 2>&1 || log "alert delivery failed"
+  printf 'url = "%s"\n' "$url" | timeout 20 curl -fsS --max-time 15 --retry 1 -o /dev/null -K - >/dev/null 2>&1 \
+    || log "heartbeat ping failed"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -361,7 +372,24 @@ check_disk() {
 # Main
 # ---------------------------------------------------------------------------------------------
 
+# `watchdog.sh --test-alert` (gatekeeper alerts test): send one message through every channel and say what happened.
+test_alert() {
+  local env="$APP_DIR/.env" label channels
+  [[ -f "$env" ]] || { echo "no $env"; return 1; }
+  channels="$(alert_channels_configured "$env")"
+  if [[ -z "$channels" ]]; then
+    echo "No alert channel is set up. Run: sudo gatekeeper alerts"
+    return 1
+  fi
+  label="$(env_file_get "$env" ALERT_NAME 2>/dev/null || true)"
+  send_alert_all "$env" "${label:-$HOSTNAME_LABEL}" "Test alert: this is the server's watchdog. If you can read this, alerts about the app or the server being down will reach you." verbose
+}
+
 main() {
+  if [[ "${1:-}" == "--test-alert" ]]; then
+    test_alert
+    exit $?
+  fi
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   rotate_log
@@ -433,6 +461,10 @@ main() {
     sdel outage_since
     sdel alerted_down
     sdel stuck_alert
+  fi
+
+  if (( ! failing && ! unknown )); then
+    heartbeat
   fi
 
   # Cheap housekeeping every ten minutes.

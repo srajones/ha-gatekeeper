@@ -36,6 +36,9 @@ const { adminRoutes } = await import("./admin.js");
 const { startGateway, stopGateway } = await import("./ha.js");
 const { haHub } = await import("./hubRuntime.js");
 const { saveSettings, resetSettings, loadSettings } = await import("./settings.js");
+const { startHaMonitor, stopHaMonitor, alertManager, probeHomeAssistant } = await import("./haMonitor.js");
+const { resolveAlertConfig, setAlertConfigForTests } = await import("./alertConfig.js");
+import http from "node:http";
 
 const app = Fastify({ logger: false });
 await app.register(cookie);
@@ -49,6 +52,7 @@ await app.register(adminRoutes, { prefix: "/admin" });
 await loadSettings(prisma);
 
 after(async () => {
+  stopHaMonitor();
   await stopGateway();
   await app.close();
   await prisma.$disconnect();
@@ -123,4 +127,64 @@ test("the live link keeps retrying quietly (backoff), it does not spin", async (
   await sleep(1500);
   assert.equal(haHub.status().reconnects, before, "no successful connection, and no busy loop either");
   assert.equal(haHub.status().running, true);
+});
+
+test("probe: every kind of failure is described in plain words", async () => {
+  const reply = (status: number) => async () => new Response("x", { status });
+  assert.deepEqual(await probeHomeAssistant(reply(200) as unknown as typeof fetch), { up: true });
+  assert.match((await probeHomeAssistant(reply(401) as unknown as typeof fetch)).reason!, /rejected the access token \(HTTP 401\)/);
+  assert.match((await probeHomeAssistant(reply(403) as unknown as typeof fetch)).reason!, /rejected the access token/);
+  assert.match((await probeHomeAssistant(reply(502) as unknown as typeof fetch)).reason!, /HTTP 502/);
+  const refused = async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }); };
+  assert.match((await probeHomeAssistant(refused as unknown as typeof fetch)).reason!, /cannot connect to Home Assistant \(ECONNREFUSED\)/);
+  const timeout = async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); };
+  assert.match((await probeHomeAssistant(timeout as unknown as typeof fetch)).reason!, /no answer from Home Assistant within 8 s/);
+  const real = await probeHomeAssistant();
+  assert.equal(real.up, false);
+  assert.match(real.reason!, /cannot connect/);
+});
+
+test("the monitor notices the outage by itself and the dashboard shows it, with no channel set up yet", async () => {
+  setAlertConfigForTests(resolveAlertConfig({}));
+  startHaMonitor();
+  const start = Date.now();
+  while (!alertManager.status().haDown) {
+    if (Date.now() - start > 5000) throw new Error("the monitor did not notice");
+    await sleep(50);
+  }
+  const cookieValue = await adminCookie();
+  const view = (await app.inject({ method: "GET", url: "/admin/alerts", headers: { cookie: cookieValue } })).json();
+  assert.equal(view.ok, true);
+  assert.equal(view.state.haDown, true);
+  assert.equal(view.state.alerted, false, "not yet: the delay has not passed");
+  assert.deepEqual(view.channels.map((c: { configured: boolean }) => c.configured), [false, false, false, false]);
+  const test = await app.inject({ method: "POST", url: "/admin/alerts/test", headers: { cookie: cookieValue } });
+  assert.equal(test.statusCode, 409);
+  assert.equal(test.json().error, "no_channels");
+  const anonymous = await app.inject({ method: "GET", url: "/admin/alerts" });
+  assert.equal(anonymous.statusCode, 401);
+  assert.equal((await app.inject({ method: "POST", url: "/admin/alerts/test" })).statusCode, 401);
+});
+
+test("the test button sends through every configured channel and reports each result", async () => {
+  const got: string[] = [];
+  const web = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => { got.push(body); res.writeHead(req.url === "/bad" ? 500 : 200); res.end(); });
+  });
+  await new Promise<void>((resolve) => web.listen(0, "127.0.0.1", resolve));
+  const port = (web.address() as { port: number }).port;
+  setAlertConfigForTests(resolveAlertConfig({ ALERT_WEBHOOK_URL: `http://127.0.0.1:${port}/hook`, ALERT_NTFY_URL: `http://127.0.0.1:${port}/bad` }));
+  const cookieValue = await adminCookie();
+  const res = await app.inject({ method: "POST", url: "/admin/alerts/test", headers: { cookie: cookieValue } });
+  web.close();
+  assert.equal(res.statusCode, 200);
+  const results = res.json().results as Array<{ channel: string; ok: boolean; error?: string }>;
+  assert.deepEqual(results.map((r) => [r.channel, r.ok]).sort(), [["ntfy", false], ["webhook", true]]);
+  assert.ok(got.some((b) => b.includes("Test alert")));
+  const row = await prisma.auditLog.findFirst({ where: { actionIdRaw: "admin.alerts.test" }, orderBy: { timestamp: "desc" } });
+  assert.equal(row?.success, false);
+  assert.equal(row?.error, "ntfy");
+  setAlertConfigForTests(null);
 });

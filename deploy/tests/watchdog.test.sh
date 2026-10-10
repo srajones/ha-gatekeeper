@@ -52,6 +52,42 @@ http.createServer((q, r) => {
 http.createServer((q, r) => {
   let b = ""; q.on("data", d => b += d); q.on("end", () => { fs.appendFileSync(`${T}/webhook.log`, b + "\n"); r.writeHead(200); r.end("ok"); });
 }).listen(19999, "127.0.0.1");
+// ntfy / telegram / heartbeat receiver: logs "METHOD URL HEADERS-JSON BODY"; /bad answers 500
+http.createServer((q, r) => {
+  let b = ""; q.on("data", d => b += d); q.on("end", () => {
+    fs.appendFileSync(`${T}/chan.log`, JSON.stringify({ m: q.method, u: q.url, h: q.headers, b }) + "\n");
+    r.writeHead(q.url.startsWith("/bad") ? 500 : 200); r.end("ok");
+  });
+}).listen(19997, "127.0.0.1");
+// a minimal SMTP receiver (plain text) recording each message
+import net from "node:net";
+net.createServer((sock) => {
+  let buf = "", data = false, mail = { from: "", to: [], data: "", auth: "" };
+  const send = (l) => sock.write(l + "\r\n");
+  send("220 fake ESMTP");
+  sock.on("error", () => {});
+  sock.on("data", (c) => {
+    buf += c.toString();
+    let i;
+    while ((i = buf.indexOf("\r\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (mail.waitAuth) { mail.waitAuth = false; mail.auth = Buffer.from(line, "base64").toString().replace(/\0/g, "|"); send("235 ok"); continue; }
+      if (data) { if (line === ".") { data = false; fs.appendFileSync(`${T}/mail.log`, JSON.stringify(mail) + "\n"); send("250 queued"); mail = { from: "", to: [], data: "", auth: "" }; } else mail.data += line + "\n"; continue; }
+      const u = line.toUpperCase();
+      if (u.startsWith("EHLO") || u.startsWith("HELO")) sock.write("250-fake\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n");
+      else if (u.startsWith("AUTH PLAIN")) {
+        if (line.split(" ")[2]) { mail.auth = Buffer.from(line.split(" ")[2], "base64").toString().replace(/\0/g, "|"); send("235 ok"); }
+        else { mail.waitAuth = true; send("334 "); }
+      }
+      else if (u.startsWith("AUTH LOGIN")) { send("334 VXNlcm5hbWU6"); mail.auth = "login"; }
+      else if (u.startsWith("MAIL FROM:")) { mail.from = (/<([^>]*)>/.exec(line) || [])[1] || ""; send("250 ok"); }
+      else if (u.startsWith("RCPT TO:")) { mail.to.push((/<([^>]*)>/.exec(line) || [])[1] || ""); send("250 ok"); }
+      else if (u === "DATA") { data = true; send("354 go"); }
+      else if (u === "QUIT") { send("221 bye"); sock.end(); }
+      else send("250 ok");
+    }
+  });
+}).listen(19996, "127.0.0.1");
 EOF
 (nohup node "$T/servers.mjs" "$T" > "$T/servers.log" 2>&1 &); sleep 1
 
@@ -160,6 +196,76 @@ mv "$T/app/.env" "$T/app/.env.bak"; "$WD" >/dev/null 2>&1; rc=$?
 [[ $rc == 0 ]] && ok "exit 0 without .env" || bad "exit $rc"
 grep -q "not configured" "$T/wd.log" && ok "explains why" || bad "no explanation"
 mv "$T/app/.env.bak" "$T/app/.env"
+
+echo "D: every alert channel delivers from the host watchdog (ntfy, Telegram, e-mail, webhook), independently"
+: > "$T/chan.log"; : > "$T/mail.log"; : > "$T/webhook.log"
+cat > "$T/app/.env" <<EOF
+GATEKEEPER_PORT="18999"
+ALERT_NAME="vultr-1"
+ALERT_WEBHOOK_URL="http://127.0.0.1:19999/hook"
+ALERT_NTFY_URL="http://127.0.0.1:19997/ntfy-topic"
+ALERT_NTFY_TOKEN="tk_secret"
+ALERT_TELEGRAM_BOT_TOKEN="111:tg-secret"
+ALERT_TELEGRAM_CHAT_ID="777"
+ALERT_TELEGRAM_API_BASE="http://127.0.0.1:19997/tg"
+ALERT_EMAIL_TO="david@example.com, other@example.org"
+SMTP_HOST="127.0.0.1"
+SMTP_PORT="19996"
+SMTP_SECURITY="none"
+SMTP_FROM="gatekeeper@example.com"
+HEARTBEAT_URL="http://127.0.0.1:19997/heartbeat/abc"
+EOF
+out="$("$WD" --test-alert 2>&1)"; rc=$?
+[[ $rc == 0 ]] && ok "--test-alert exits 0 when every channel delivered" || bad "test-alert rc=$rc: $out"
+for ch in webhook ntfy telegram email; do echo "$out" | grep -q "^$ch  *delivered" && ok "test-alert reports $ch delivered" || bad "no 'delivered' line for $ch: $out"; done
+grep -q 'vultr-1' "$T/webhook.log" && ok "webhook message carries the server name" || bad "webhook: $(cat "$T/webhook.log")"
+ntfy_line="$(grep '"u":"/ntfy-topic"' "$T/chan.log" | head -1)"
+echo "$ntfy_line" | jq -e '.h.authorization == "Bearer tk_secret" and (.h.title | test("vultr-1")) and (.b | test("Test alert"))' >/dev/null 2>&1 && ok "ntfy: token, title and body arrive" || bad "ntfy: $ntfy_line"
+tg_line="$(grep '"u":"/tg/bot111:tg-secret/sendMessage"' "$T/chan.log" | head -1)"
+echo "$tg_line" | jq -e '(.b | test("chat_id=777")) and (.b | test("Test"))' >/dev/null 2>&1 && ok "telegram: chat id and text arrive at the bot API" || bad "telegram: $tg_line"
+mail_line="$(head -1 "$T/mail.log")"
+echo "$mail_line" | jq -e '.from == "gatekeeper@example.com" and (.to | sort) == ["david@example.com","other@example.org"] and (.data | test("Subject: \\[HA Gatekeeper @ vultr-1\\]")) and (.data | test("Test alert"))' >/dev/null 2>&1 && ok "e-mail: sender, both recipients, subject and body arrive" || bad "mail: $mail_line"
+
+echo "D2: e-mail with a login sends the credentials (and the password is not on the curl command line)"
+: > "$T/mail.log"
+sed -i 's/^SMTP_FROM=.*/SMTP_FROM="gatekeeper@example.com"\nSMTP_USER="alerts@example.com"\nSMTP_PASSWORD="pa\\\\ss\\"word"/' "$T/app/.env"
+out="$("$WD" --test-alert 2>&1)"
+grep -q '"auth":"|alerts@example.com|pa' "$T/mail.log" && ok "SMTP login reached the server" || bad "auth: $(head -c 300 "$T/mail.log")"
+
+echo "D3: a failing channel does not stop the others, and the exit code says so only when ALL fail"
+: > "$T/chan.log"; : > "$T/webhook.log"; : > "$T/mail.log"
+sed -i 's#^ALERT_NTFY_URL=.*#ALERT_NTFY_URL="http://127.0.0.1:19997/bad-topic"#; s#^SMTP_PORT=.*#SMTP_PORT="1"#' "$T/app/.env"
+out="$("$WD" --test-alert 2>&1)"; rc=$?
+echo "$out" | grep -q "^ntfy  *FAILED" && ok "ntfy failure reported" || bad "$out"
+echo "$out" | grep -q "^email  *FAILED" && ok "email failure reported" || bad "$out"
+echo "$out" | grep -q "^webhook  *delivered" && echo "$out" | grep -q "^telegram  *delivered" && ok "webhook and Telegram still delivered" || bad "$out"
+[[ $rc == 0 ]] && ok "exit 0: at least one channel delivered" || bad "rc=$rc"
+cat > "$T/app/.env" <<EOF
+GATEKEEPER_PORT="18999"
+ALERT_NTFY_URL="http://127.0.0.1:19997/bad-topic"
+EOF
+"$WD" --test-alert >/dev/null 2>&1; rc=$?
+[[ $rc != 0 ]] && ok "non-zero exit when every channel failed" || bad "rc=$rc"
+echo "$out" | grep -q "tk_secret\|tg-secret" && bad "a secret was printed by --test-alert" || ok "no secret in the --test-alert output"
+cat > "$T/app/.env" <<EOF
+GATEKEEPER_PORT="18999"
+EOF
+out="$("$WD" --test-alert 2>&1)"; rc=$?
+[[ $rc != 0 ]] && echo "$out" | grep -q "gatekeeper alerts" && ok "no channel: says how to set one up" || bad "$out"
+
+echo "D4: heartbeat: pinged after healthy runs only, never while failing"
+rm -f "$T/state/"*; : > "$T/chan.log"; : > "$T/wd.log"; : > "$T/calls.log"
+cat > "$T/app/.env" <<EOF
+GATEKEEPER_PORT="18999"
+HEARTBEAT_URL="http://127.0.0.1:19997/heartbeat/abc"
+EOF
+echo "$running_healthy" > "$T/state.ha-gatekeeper"; touch "$T/http_ok"
+run; run
+hb_ok="$(grep -c '"u":"/heartbeat/abc"' "$T/chan.log")"
+[[ "$hb_ok" == 2 ]] && ok "2 healthy runs -> 2 heartbeat pings" || bad "heartbeat pings: $hb_ok"
+: > "$T/chan.log"; echo "$running_unhealthy" > "$T/state.ha-gatekeeper"; rm -f "$T/http_ok"
+run; run
+[[ "$(grep -c '"u":"/heartbeat/abc"' "$T/chan.log")" == 0 ]] && ok "no heartbeat while the app is failing (so the outside service raises the alarm)" || bad "heartbeat sent while failing"
 
 pkill -f "servers.mjs $T" 2>/dev/null
 echo; echo "RESULT: $pass passed, $failn failed"

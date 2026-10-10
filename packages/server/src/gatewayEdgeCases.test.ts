@@ -98,6 +98,7 @@ const { adminRoutes } = await import("./admin.js");
 const { startGateway, stopGateway } = await import("./ha.js");
 const { haHub } = await import("./hubRuntime.js");
 const { saveSettings, resetSettings, loadSettings } = await import("./settings.js");
+const { startHaMonitor, stopHaMonitor, alertManager } = await import("./haMonitor.js");
 
 const app = Fastify({ logger: false });
 await app.register(cookie);
@@ -111,6 +112,7 @@ await app.register(adminRoutes, { prefix: "/admin" });
 await loadSettings(prisma);
 
 after(async () => {
+  stopHaMonitor();
   await stopGateway();
   await app.close();
   await prisma.$disconnect();
@@ -370,4 +372,18 @@ test("one key hitting its rate limit does not slow another key down", async () =
   }
   assert.deepEqual(codesB, [200, 200, 200, 200]);
   await resetSettings(prisma);
+});
+
+test("the alert monitor follows the live link: down when Home Assistant goes away, up again when it is back", async () => {
+  await resetSettings(prisma);
+  startGateway();
+  await until(() => haHub.isConnected(), 10_000);
+  startHaMonitor();
+  await until(() => !alertManager.status().haDown, 8000);
+  ha.refuse = true;
+  ha.dropConnections();
+  await until(() => alertManager.status().haDown, 15_000);
+  assert.equal(alertManager.status().alerted, false, "the delay (120 s by default) has not passed");
+  ha.refuse = false;
+  await until(() => !alertManager.status().haDown, 20_000);
 });

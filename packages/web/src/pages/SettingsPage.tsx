@@ -4,6 +4,7 @@ import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Input } from "../components/ui/input";
+import { AlertsCard } from "../components/AlertsCard";
 
 type SettingsPageProps = {
   settings: GatewaySettings | null;
@@ -201,6 +202,7 @@ export function SettingsPage({
       </section>
 
       <ConnectionCard connection={connection} mode={settings.stateSource} />
+      <AlertsCard downAfterSeconds={settings.alertDownAfterSeconds} />
 
       <Card>
         <CardContent className="space-y-8 p-6">

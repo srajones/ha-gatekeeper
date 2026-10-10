@@ -13,6 +13,7 @@ import { prisma } from "./db.js";
 import { adminRoutes } from "./admin.js";
 import { publicApiRoutes } from "./publicApi.js";
 import { startGateway, stopGateway } from "./ha.js";
+import { startHaMonitor, stopHaMonitor } from "./haMonitor.js";
 import { setHubLogger } from "./hubRuntime.js";
 import { loadSettings } from "./settings.js";
 
@@ -24,6 +25,7 @@ const app = Fastify({ logger: true, trustProxy });
 setHubLogger({ info: (message) => app.log.info(message), warn: (message) => app.log.warn(message) });
 await loadSettings(prisma);
 app.addHook("onClose", async () => {
+  stopHaMonitor();
   await stopGateway();
 });
 
@@ -69,7 +71,14 @@ if (fs.existsSync(webDist)) {
   });
 }
 
-app.get("/healthz", async () => ({ ok: true }));
+// Health for Docker and the watchdog. It must NOT depend on Home Assistant (a Home Assistant outage is not a
+// reason to restart this server) but it does check what this server cannot work without: its database.
+app.get("/healthz", async (_request, reply) => {
+  if (await databaseResponds()) {
+    return { ok: true };
+  }
+  return reply.status(503).send({ ok: false, error: "database" });
+});
 
 await app.register(publicApiRoutes, { prefix: "/api" });
 await app.register(adminRoutes, { prefix: "/admin" });
@@ -103,11 +112,61 @@ async function pruneAuditLogs() {
   }
 }
 
+async function databaseResponds(): Promise<boolean> {
+  try {
+    await Promise.race([
+      prisma.$queryRaw`SELECT 1`,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("database timeout")), 3000).unref())
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Self-healing: if the database stops answering for a minute and a half, exit so Docker (restart policy)
+// starts a fresh process right away, without waiting for the host watchdog. A crash anywhere else does the same.
+let dbFailures = 0;
+setInterval(async () => {
+  if (await databaseResponds()) {
+    dbFailures = 0;
+    return;
+  }
+  dbFailures += 1;
+  app.log.error({ dbFailures }, "database_not_responding");
+  if (dbFailures >= 3) {
+    app.log.fatal("database not responding for 90 s: exiting so Docker restarts the process");
+    process.exit(1);
+  }
+}, 30_000).unref();
+
+// `docker stop` / restart: finish in-flight requests and close the database cleanly, but never hang.
+let shuttingDown = false;
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    app.log.info({ signal }, "shutting_down");
+    setTimeout(() => process.exit(0), 8000).unref();
+    app.close().then(() => prisma.$disconnect()).finally(() => process.exit(0));
+  });
+}
+
+process.on("uncaughtException", (err) => {
+  app.log.fatal({ err }, "uncaught_exception: exiting so Docker restarts the process");
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  app.log.fatal({ err }, "unhandled_rejection: exiting so Docker restarts the process");
+  process.exit(1);
+});
+
 const start = async () => {
   try {
     await pruneAuditLogs();
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
     startGateway();
+    startHaMonitor();
   } catch (err) {
     app.log.error(err);
     process.exit(1);
