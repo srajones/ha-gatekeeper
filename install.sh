@@ -2530,7 +2530,9 @@ http_do() {
   return "$rc"
 }
 
-# admin_login BASE [curl args...] -> sets HTTP_COOKIE. 0 ok | 1 no response | 2 rejected | 3 no cookie
+# admin_login BASE [curl args...] -> sets HTTP_COOKIE.
+#   0 ok | 1 no response | 2 rejected | 3 no cookie
+#   4 password accepted but the dashboard's two-factor login wants a code too (the cookie is a half-finished login)
 admin_login() {
   local base="$1" payload
   shift
@@ -2541,6 +2543,8 @@ admin_login() {
   COOKIE_ATTRS="$(awk -F': ' 'tolower($1) == "set-cookie" { print $2; exit }' <<<"$LAST_HEADERS")"
   HTTP_COOKIE="${COOKIE_ATTRS%%;*}"
   [[ -n "$HTTP_COOKIE" ]] || return 3
+  [[ "$LAST_BODY" != *'"needs2fa":true'* ]] || return 4
+  return 0
 }
 
 # The way a user's browser reaches the app: through Caddy when it is enabled, else directly.
@@ -2833,8 +2837,11 @@ verify_app() {
     admin_login "$FD_BASE" || rc=$?
   fi
 
+  local two_factor=false
   case "$rc" in
     0) vpass "Admin login works with the configured password${fd_note:- via $FD_BASE}" ;;
+    4) two_factor=true
+       vpass "Admin password accepted; two-factor login is on, so a code is also required${fd_note:- via $FD_BASE}" ;;
     1) vfail "No response from $FD_BASE/admin/login" "${LAST_ERR:-check Caddy and the app logs}"; return 0 ;;
     2) vfail "Admin login was rejected (HTTP $LAST_CODE)" "The password in .env does not match what the running container has. Re-run: sudo $APP_DIR/install.sh"; return 0 ;;
     *) vfail "Admin login succeeded but no session cookie was set"; return 0 ;;
@@ -2847,7 +2854,16 @@ verify_app() {
   fi
 
   http_do GET "$FD_BASE/admin/me" "" "${FD_ARGS[@]}" || true
-  if [[ "$LAST_BODY" == *'"authenticated":true'* ]]; then
+  if $two_factor; then
+    # The half-finished login must not be an admin session.
+    if [[ "$LAST_BODY" == *'"authenticated":false'* && "$LAST_BODY" == *'"twoFactorPending":true'* ]]; then
+      vpass "The password step alone is not an admin session (waiting for the code)"
+    else
+      vfail "After the password step the session should be waiting for the two-factor code" "Got: ${LAST_BODY:0:120}"
+    fi
+    http_do GET "$FD_BASE/admin/clients" "" "${FD_ARGS[@]}" || true
+    if [[ "$LAST_CODE" == 401 ]]; then vpass "The admin API stays closed until the code is entered (401)"; else vfail "The admin API answered HTTP $LAST_CODE before the two-factor code was entered (expected 401)"; fi
+  elif [[ "$LAST_BODY" == *'"authenticated":true'* ]]; then
     vpass "Session is accepted on the next request (cookie round-trip works)"
   else
     vfail "The session cookie was not accepted on the next request" "Behind HTTPS this usually means the proxy is not forwarding correctly. gatekeeper logs; docker logs $CADDY_CONTAINER"
@@ -2862,6 +2878,11 @@ verify_app() {
 
   verify_ha_from_container
   verify_live_connection
+
+  if $two_factor; then
+    vpass "Skipped the checks that need a signed-in dashboard session (entity list, temporary token): they would need a two-factor code"
+    return 0
+  fi
 
   http_do GET "$FD_BASE/admin/ha/entities" "" "${FD_ARGS[@]}" || true
   local count entity other
@@ -4317,6 +4338,22 @@ cmd_secrets() {
   ok "Secret files in $APP_DIR/secrets are up to date with .env"
 }
 
+# Lock-out recovery for the optional two-factor login. Needs shell access to this server, which is the
+# point: only someone who can already control the server can switch the second factor off this way.
+cmd_2fa_reset() {
+  load_runtime_config
+  require_docker
+  docker_up || die "Docker is not running."
+  local running
+  running="$(docker inspect -f '{{.State.Running}}' "$GK_CONTAINER" 2>/dev/null || true)"
+  [[ "$running" == true ]] || die "The $GK_CONTAINER container is not running. Start it first:  gatekeeper start"
+  say "Two-factor login is currently: $(dc exec -T gatekeeper node dist/totpCli.js status 2>/dev/null || echo unknown)"
+  say "This switches it OFF. The administrator password still applies. Turn it on again in the dashboard (Security)."
+  confirm_cmd "Switch two-factor login off?" n || die "Cancelled. Nothing was changed."
+  dc exec -T gatekeeper node dist/totpCli.js reset || die "Could not reset two-factor login."
+  ok "Two-factor login is off. Sign in with the password, then turn it on again under Security."
+}
+
 cmd_logs() {
   load_runtime_config
   require_docker
@@ -4553,7 +4590,7 @@ verify_app_quick_ok() {
   base="$(local_url)"
   http_do GET "$base/healthz" "" && [[ "$LAST_BODY" == *'"ok":true'* ]] || return 1
   admin_login "$base" || rc=$?
-  (( rc == 0 ))
+  (( rc == 0 || rc == 4 ))  # 4: password accepted, a two-factor code is also required
 }
 
 cmd_uninstall() {
@@ -4635,6 +4672,7 @@ Commands
   backup             Back up the database and .env into ./backups.
   restore FILE       Restore a backup made by 'backup'.
   uninstall          Remove services and containers (asks before touching data).
+  2fa-reset          Switch the administrator's two-factor login off (phone AND recovery codes lost).
   help
 
 Options
@@ -4688,7 +4726,7 @@ parse_args() {
       --quiet) QUIET=true ;;
       -v|--verbose) VERBOSE=true ;;
       --no-color) NO_COLOR_FLAG=true ;;
-      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|help)
+      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|help)
         if $have_command; then
           COMMAND_ARGS+=("$arg")
         else
@@ -4862,6 +4900,7 @@ main() {
     restore)   cmd_restore ;;
     uninstall) cmd_uninstall ;;
     secrets)   cmd_secrets ;;
+    2fa-reset) cmd_2fa_reset ;;
     *)         usage; exit 1 ;;
   esac
 }

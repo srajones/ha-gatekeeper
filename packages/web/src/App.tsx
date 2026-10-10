@@ -2,9 +2,10 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ApiError, type QuickSetupResult, type TokenPermission } from "./api";
 import { AppShell, type Tab } from "./components/AppShell";
-import { LoginCard } from "./components/LoginCard";
+import { LoginCard, TwoFactorCard } from "./components/LoginCard";
 import { ActivityPage } from "./pages/ActivityPage";
 import { QuickStartPage } from "./pages/QuickStartPage";
+import { SecurityPage } from "./pages/SecurityPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TokensPage } from "./pages/TokensPage";
 
@@ -12,6 +13,7 @@ export default function App() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<Tab>("Quick Start");
   const [password, setPassword] = useState("");
+  const [code, setCode] = useState("");
   const [quickSetupResult, setQuickSetupResult] = useState<QuickSetupResult | null>(null);
   const [issuedKey, setIssuedKey] = useState<string | null>(null);
 
@@ -77,9 +79,28 @@ export default function App() {
     }
   });
 
-  const loginMutation = useMutation<{}, ApiError, string>({
+  const loginMutation = useMutation<{ needs2fa?: boolean }, ApiError, string>({
     mutationFn: (pwd: string) => api.login(pwd),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["me"] })
+    onSuccess: () => {
+      setPassword("");
+      queryClient.invalidateQueries({ queryKey: ["me"] });
+    }
+  });
+
+  // Second step, when two-factor login is on and the password was already accepted.
+  const twoFactorMutation = useMutation<{}, ApiError, string>({
+    mutationFn: (value: string) => api.login2fa(value),
+    onSuccess: () => {
+      setCode("");
+      queryClient.invalidateQueries({ queryKey: ["me"] });
+    },
+    onError: (error) => {
+      // the half-finished login is gone on the server: go back to the password
+      if (error.code === "too_many_attempts" || error.code === "login_expired") {
+        setCode("");
+        queryClient.invalidateQueries({ queryKey: ["me"] });
+      }
+    }
   });
 
   const logoutMutation = useMutation({
@@ -87,6 +108,9 @@ export default function App() {
     onSuccess: () => {
       setQuickSetupResult(null);
       setIssuedKey(null);
+      setCode("");
+      loginMutation.reset();
+      twoFactorMutation.reset();
       queryClient.invalidateQueries({ queryKey: ["me"] });
     }
   });
@@ -126,6 +150,23 @@ export default function App() {
       queryClient.invalidateQueries({ queryKey: ["clients"] });
     }
   });
+
+  if (!authenticated && (meQuery.data?.twoFactorPending ?? false)) {
+    return (
+      <div className="min-h-screen bg-[var(--background)] px-6 py-16 text-[var(--foreground)]">
+        <div className="mx-auto max-w-md">
+          <TwoFactorCard
+            code={code}
+            onCodeChange={setCode}
+            onSubmit={() => twoFactorMutation.mutate(code.trim())}
+            onCancel={() => logoutMutation.mutate()}
+            isSubmitting={twoFactorMutation.isPending}
+            error={twoFactorMutation.error}
+          />
+        </div>
+      </div>
+    );
+  }
 
   if (!authenticated) {
     return (
@@ -204,6 +245,8 @@ export default function App() {
           onReset={() => resetSettingsMutation.mutate()}
         />
       ) : null}
+
+      {tab === "Security" ? <SecurityPage /> : null}
     </AppShell>
   );
 }

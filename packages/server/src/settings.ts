@@ -107,7 +107,8 @@ export async function saveSettings(prisma: PrismaClient, patch: GatewaySettingsP
 }
 
 export async function resetSettings(prisma: PrismaClient): Promise<GatewaySettings> {
-  await prisma.setting.deleteMany();
+  // only the options: other rows in this table (such as the two-factor state) are not settings
+  await prisma.setting.deleteMany({ where: { key: { in: [...SETTING_KEYS] } } });
   const next = defaultSettings();
   apply(next);
   return next;

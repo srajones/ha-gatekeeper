@@ -77,6 +77,18 @@ export type SettingHelp = {
   max?: number;
 };
 
+export type TwoFactorStatus = {
+  available: boolean;
+  enabled: boolean;
+  recoveryCodesLeft: number;
+};
+
+export type TwoFactorSetup = {
+  secret: string;
+  otpauthUri: string;
+  issuer: string;
+};
+
 export type ConnectionStatus = {
   settings: GatewaySettings;
   live: {
@@ -147,12 +159,29 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<ApiResp
 
 export const api = {
   login: (password: string) =>
-    apiFetch<{}>("/admin/login", {
+    apiFetch<{ needs2fa?: boolean }>("/admin/login", {
       method: "POST",
       body: JSON.stringify({ password })
     }),
+  login2fa: (code: string) =>
+    apiFetch<{ recoveryCodeUsed?: boolean }>("/admin/login/2fa", {
+      method: "POST",
+      body: JSON.stringify({ code })
+    }),
+  twoFactor: () => apiFetch<TwoFactorStatus>("/admin/2fa"),
+  twoFactorSetup: (password: string) =>
+    apiFetch<TwoFactorSetup>("/admin/2fa/setup", { method: "POST", body: JSON.stringify({ password }) }),
+  twoFactorEnable: (code: string) =>
+    apiFetch<{ recoveryCodes: string[] }>("/admin/2fa/enable", { method: "POST", body: JSON.stringify({ code }) }),
+  twoFactorDisable: (password: string, code: string) =>
+    apiFetch<{}>("/admin/2fa/disable", { method: "POST", body: JSON.stringify({ password, code }) }),
+  twoFactorRecoveryCodes: (password: string, code: string) =>
+    apiFetch<{ recoveryCodes: string[] }>("/admin/2fa/recovery-codes", {
+      method: "POST",
+      body: JSON.stringify({ password, code })
+    }),
   logout: () => apiFetch<{}>("/admin/logout", { method: "POST" }),
-  me: () => apiFetch<{ authenticated: boolean }>("/admin/me"),
+  me: () => apiFetch<{ authenticated: boolean; addonMode?: boolean; twoFactorPending?: boolean }>("/admin/me"),
   clients: () => apiFetch<{ clients: Client[] }>("/admin/clients"),
   createClient: (payload: {
     name: string;

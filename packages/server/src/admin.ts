@@ -19,6 +19,7 @@ import { generateApiKey, timingSafeEqual } from "./security.js";
 import { isAdminAuthenticated, isAdminLoginAllowed, isTrustedIngressRequest } from "./adminAuth.js";
 import { logAudit } from "./audit.js";
 import { rateLimitErrorResponseBuilder } from "./rateLimit.js";
+import { loadTotpState, registerTotpRoutes } from "./adminTotp.js";
 
 function sendUnauthorized(reply: FastifyReply) {
   return reply.status(401).send({ ok: false, error: "unauthorized" });
@@ -138,6 +139,21 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(401).send({ ok: false, error: "invalid_credentials" });
       }
 
+      // Password accepted. With two-factor on, the login is only half done: remember that (not as admin)
+      // and wait for the code at POST /admin/login/2fa.
+      if ((await loadTotpState()) !== null) {
+        request.session.set("pending2fa", Date.now());
+        request.session.set("fails2fa", 0);
+        await logAudit(request.log, {
+          clientId: null,
+          permissionId: null,
+          actionIdRaw: "admin.login.password",
+          ip,
+          success: true
+        });
+        return reply.send({ ok: true, needs2fa: true });
+      }
+
       request.session.set("admin", true);
       await logAudit(request.log, {
         clientId: null,
@@ -149,6 +165,8 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
       return reply.send({ ok: true });
     }
   );
+
+  registerTotpRoutes(app, { ensureAdmin });
 
   app.post("/logout", async (request, reply) => {
     request.session.delete();
@@ -162,10 +180,15 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     return reply.send({ ok: true });
   });
 
-  app.get("/me", async (request) => ({
-    authenticated: getAdminAuthenticated(request),
-    addonMode: env.HA_GATEKEEPER_ADDON
-  }));
+  app.get("/me", async (request) => {
+    const pending = request.session.get("pending2fa");
+    return {
+      authenticated: getAdminAuthenticated(request),
+      addonMode: env.HA_GATEKEEPER_ADDON,
+      // the password was accepted and the second factor is still owed
+      twoFactorPending: typeof pending === "number" && Date.now() - pending < 5 * 60_000
+    };
+  });
 
   app.get("/ha/services", async (request, reply) => {
     if (!ensureAdmin(request, reply)) {

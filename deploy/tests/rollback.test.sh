@@ -496,6 +496,16 @@ run_case emptydiscard '
 '
 ck "a declined run (log discarded) claims no kept log" bash -c "! grep -q 'Kept for you' '$CASE_OUT'"
 
+echo "admin_login understands the two-factor step (verify and update must not fail when it is on)"
+run_case adminlogin2fa '
+  CFG[ADMIN_PASSWORD]=pw
+  http_do() { LAST_CODE=200; LAST_BODY="$FAKE_BODY"; LAST_HEADERS="Set-Cookie: hgk_admin=abc; Path=/; HttpOnly"; return 0; }
+  FAKE_BODY="{\"ok\":true,\"needs2fa\":true}"; rc=0; admin_login http://x || rc=$?; echo "rc-2fa=$rc"
+  FAKE_BODY="{\"ok\":true}"; rc=0; admin_login http://x || rc=$?; echo "rc-plain=$rc"
+'
+ck "needs2fa => status 4" out_has "rc-2fa=4"
+ck "plain login => status 0" out_has "rc-plain=0"
+
 echo "a failed final health check names its cause"
 ck "the verify failure sets a rollback cause" grep -q 'ROLLBACK_CAUSE="the final health check failed' "$REPO/install.sh"
 
