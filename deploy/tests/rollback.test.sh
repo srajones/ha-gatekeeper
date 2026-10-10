@@ -5,7 +5,7 @@
 #   Run: bash deploy/tests/rollback.test.sh
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ROOT="$(mktemp -d)"
-trap 'rm -rf "$ROOT"' EXIT
+trap '[[ -n "${KEEP_ROOT:-}" ]] || rm -rf "$ROOT"' EXIT
 pass=0; failn=0
 
 ck() { # ck "name" command...   (success = pass)
@@ -136,6 +136,7 @@ run_case() {
     trap cleanup EXIT
     trap 'on_error $? $LINENO' ERR
     APP_DIR="$T/app"; LOG_FILE="$T/install.log"; REAL_LOG_FILE="$T/install.log"; PKG=apt
+    MAIN_PID=$BASHPID
     NO_COLOR_FLAG=true; setup_colors
     have_systemd() { return 0; }
     journal_tmp >/dev/null
@@ -214,7 +215,7 @@ run_case sigint '
   src="$(mktemp)"; printf x >"$src"
   INSTALL_ACTIVE=true
   jx_install_file "$src" "$T/a.txt" 644
-  kill -INT $$
+  kill -INT $BASHPID
   sleep 5
 '
 t "Ctrl-C exit code" 130 "$CASE_RC"

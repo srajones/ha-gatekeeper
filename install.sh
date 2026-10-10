@@ -414,7 +414,7 @@ rv_pkgs_since() {
   [[ -n "$cand" ]] || return 0
   # shellcheck disable=SC2086
   sim="$(apt-get -s remove --purge $cand 2>/dev/null | awk '$1 == "Remv" || $1 == "Purg" {print $2}' | LC_ALL=C sort -u)"
-  extra="$(LC_ALL=C comm -13 <(tr ' ' '\n' <<<"$cand" | LC_ALL=C sort -u) <<<"$sim" | tr '\n' ' ')"
+  extra="$(LC_ALL=C comm -13 <(tr ' ' '\n' <<<"$cand" | LC_ALL=C sort -u) <(printf '%s\n' "$sim") | tr '\n' ' ')"
   if [[ -n "${extra// /}" ]]; then
     RV_NOTE="removing $cand would also remove $extra; left installed (remove by hand if you want)"
     return 2
