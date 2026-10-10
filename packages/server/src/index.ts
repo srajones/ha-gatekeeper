@@ -12,12 +12,20 @@ import { env, isProd } from "./env.js";
 import { prisma } from "./db.js";
 import { adminRoutes } from "./admin.js";
 import { publicApiRoutes } from "./publicApi.js";
+import { startGateway, stopGateway } from "./ha.js";
+import { setHubLogger } from "./hubRuntime.js";
+import { loadSettings } from "./settings.js";
 
 // Fastify 5 no longer takes a hop count directly; trust the first N addresses from the socket.
 const trustProxy =
   typeof env.TRUST_PROXY === "number" ? (_address: string, hop: number) => hop < Number(env.TRUST_PROXY) : env.TRUST_PROXY;
 
 const app = Fastify({ logger: true, trustProxy });
+setHubLogger({ info: (message) => app.log.info(message), warn: (message) => app.log.warn(message) });
+await loadSettings(prisma);
+app.addHook("onClose", async () => {
+  await stopGateway();
+});
 
 await app.register(cors, {
   origin: env.CORS_ORIGIN,
@@ -99,6 +107,7 @@ const start = async () => {
   try {
     await pruneAuditLogs();
     await app.listen({ port: env.PORT, host: "0.0.0.0" });
+    startGateway();
   } catch (err) {
     app.log.error(err);
     process.exit(1);

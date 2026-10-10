@@ -43,3 +43,10 @@ model AuditLog {
   success      Boolean
   error        String?
 }
+
+// Behaviour chosen in the admin dashboard (Settings): one row per option, the value is JSON.
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @default(now())
+}

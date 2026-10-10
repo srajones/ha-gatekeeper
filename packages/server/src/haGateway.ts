@@ -21,10 +21,24 @@ export class ConcurrencyLimiter {
   private readonly queue: Waiter[] = [];
 
   constructor(
-    private readonly maxConcurrent: number,
-    private readonly maxQueue: number,
+    private maxConcurrent: number,
+    private maxQueue: number,
     private readonly maxWaitMs: number
   ) {}
+
+  // Changes the limit while running (settings page). Waiters are let in if the limit went up.
+  setLimits(maxConcurrent: number, maxQueue: number): void {
+    this.maxConcurrent = maxConcurrent;
+    this.maxQueue = maxQueue;
+    while (this.queue.length > 0 && this.active < this.maxConcurrent) {
+      const next = this.queue.shift();
+      if (next) {
+        clearTimeout(next.timer);
+        this.active += 1;
+        next.resolve();
+      }
+    }
+  }
 
   async run<T>(fn: () => Promise<T>): Promise<T> {
     await this.acquire();
@@ -88,7 +102,7 @@ export class CoalescingCache<T> {
   private generation = 0;
 
   constructor(
-    private readonly ttlMs: number,
+    private ttlMs: number,
     private readonly now: () => number = Date.now,
     private readonly maxEntries = 5000
   ) {}
@@ -124,6 +138,13 @@ export class CoalescingCache<T> {
       });
     this.inflight.set(key, promise);
     return promise;
+  }
+
+  setTtl(ttlMs: number): void {
+    this.ttlMs = ttlMs;
+    if (ttlMs <= 0) {
+      this.entries.clear();
+    }
   }
 
   // Forget everything (called after a service call: the next read must see its effect).

@@ -2,7 +2,9 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import rateLimit from "@fastify/rate-limit";
 import { prisma } from "./db.js";
 import { env } from "./env.js";
-import { fetchHaEntities, fetchHaServices } from "./ha.js";
+import { fetchHaEntities, fetchHaServices, gatewayStatus } from "./ha.js";
+import { requestHubResubscribe } from "./hubRuntime.js";
+import { SETTINGS_HELP, defaultSettings, getSettings, parseSettingsPatch, resetSettings, saveSettings } from "./settings.js";
 import {
   auditQuerySchema,
   createClientSchema,
@@ -361,6 +363,69 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     });
 
     return reply.send({ ok: true, client: normalizeClient(client), apiKey });
+  });
+
+  // The live Home Assistant connection watches exactly the entities that active keys may read.
+  // Anything that can change that set triggers a reconnect with the new list.
+  app.addHook("onResponse", async (request, reply) => {
+    const changesKeys =
+      request.method !== "GET" &&
+      reply.statusCode < 400 &&
+      (request.url.startsWith("/admin/clients") || request.url.startsWith("/admin/quick-setup"));
+    if (changesKeys) {
+      requestHubResubscribe();
+    }
+  });
+
+  app.get("/settings", async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    return reply.send({ ok: true, settings: getSettings(), defaults: defaultSettings(), help: SETTINGS_HELP });
+  });
+
+  app.put("/settings", async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    const parsed = parseSettingsPatch(request.body ?? {});
+    if (!parsed.ok) {
+      return reply.status(400).send({ ok: false, error: "invalid_settings", details: parsed.errors });
+    }
+    const before = getSettings();
+    const settings = await saveSettings(prisma, parsed.patch);
+    const changed = (Object.keys(parsed.patch) as Array<keyof typeof settings>).filter((key) => before[key] !== settings[key]);
+    await logAudit(request.log, {
+      clientId: null,
+      permissionId: null,
+      actionIdRaw: "admin.settings.update",
+      ip: request.ip ?? null,
+      success: true,
+      error: changed.length > 0 ? `changed:${changed.join(",")}` : null
+    });
+    return reply.send({ ok: true, settings });
+  });
+
+  app.post("/settings/reset", async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    const settings = await resetSettings(prisma);
+    await logAudit(request.log, {
+      clientId: null,
+      permissionId: null,
+      actionIdRaw: "admin.settings.reset",
+      ip: request.ip ?? null,
+      success: true
+    });
+    return reply.send({ ok: true, settings });
+  });
+
+  app.get("/connection", async (request, reply) => {
+    if (!ensureAdmin(request, reply)) {
+      return;
+    }
+    return reply.send({ ok: true, ...gatewayStatus() });
   });
 
   app.delete("/clients/:id", async (request, reply) => {

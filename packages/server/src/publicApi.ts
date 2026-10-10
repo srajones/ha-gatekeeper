@@ -4,7 +4,8 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { prisma } from "./db.js";
 import { env } from "./env.js";
-import { proxyHaServiceCall, proxyHaState } from "./ha.js";
+import { HaUnavailableError, proxyHaServiceCall, proxyHaState } from "./ha.js";
+import { getSettings } from "./settings.js";
 import { HaBusyError } from "./haGateway.js";
 import { asServiceRequestBody, extractRequestedEntityIds } from "./policy.js";
 import { findAllowedServicePermission, findAllowedStatePermission } from "./permissions.js";
@@ -15,7 +16,8 @@ import { isPublicApiAllowed } from "./adminAuth.js";
 import { logAudit } from "./audit.js";
 import { rateLimitErrorResponseBuilder } from "./rateLimit.js";
 
-const publicApiRateLimit = { max: 100, timeWindow: "1 minute" };
+// The per-key limit is an option in the dashboard (Settings), read on every request.
+const publicApiRateLimit = { max: () => getSettings().rateLimitPerMinute, timeWindow: "1 minute" };
 
 async function findClientByApiKey(apiKey: string): Promise<PublicApiClient | null> {
   const prefix = getApiKeyPrefix(apiKey);
@@ -390,6 +392,10 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
       if (haResponse.contentType) {
         reply.header("content-type", haResponse.contentType);
       }
+      if (haResponse.stale) {
+        // Last known state while the live link to Home Assistant is down: say so, never hide it.
+        reply.header("x-ha-stale", "1");
+      }
       // Home Assistant's status is passed through as-is; Fastify 5 types only the schema's codes.
         return reply.status(haResponse.status as never).send(haResponse.body as never);
     } catch (err) {
@@ -405,6 +411,9 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
 
       if (err instanceof HaBusyError) {
         return reply.header("retry-after", "1").status(503).send({ ok: false, error: "ha_busy" });
+      }
+      if (err instanceof HaUnavailableError) {
+        return reply.header("retry-after", "5").status(503).send({ ok: false, error: "ha_unavailable" });
       }
       request.log.error({ err }, "ha_state_proxy_failed");
       return reply.status(502).send({ ok: false, error: "ha_state_proxy_failed" });
