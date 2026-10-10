@@ -85,7 +85,7 @@ its own call even though Home Assistant's change message is still on its way.
   root-only file, not in the container environment). Nothing about what a key may read changes: the permission check
   happens before any state is looked up.
 - **In memory only.** States are never written to disk. Only the entities your keys may read are held.
-- **Home Assistant add-on mode** uses the Supervisor's websocket proxy (`/core/websocket`) with the same token as for REST.
+- **Home Assistant add-on mode** uses the Supervisor's websocket proxy (`/core/websocket`) with the same token as for REST. (This follows the Supervisor API but was not exercised against a real add-on installation; if the websocket cannot connect there, reads quietly use the ordinary path.)
 - **Only the link is monitored.** A sensor that legitimately never changes sends nothing, so staleness is judged by the
   link, not per entity. The card's "Newest change" shows when anything last changed.
 - **Why the odd-looking parts exist:** the silent-link watchdog (half-open links never announce themselves), copy-on-write

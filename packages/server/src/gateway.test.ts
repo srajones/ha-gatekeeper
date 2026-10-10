@@ -242,3 +242,20 @@ test("proxyHaState without the live link started behaves as the plain, shared RE
   await Promise.all([proxyHaState("light.a"), proxyHaState("light.a"), proxyHaState("light.a")]);
   assert.equal(restReads - before, 1);
 });
+
+test("the per-key rate limit is an option that applies at once", async () => {
+  const limited = await createTokenAccess(prisma, {
+    name: "limited",
+    status: "active",
+    permissions: [{ kind: "state", entityIds: ["light.a"] }]
+  });
+  const limitedHeaders = { authorization: `Bearer ${limited.apiKey}` };
+  await saveSettings(prisma, { rateLimitPerMinute: 3 });
+  const codes: number[] = [];
+  for (let i = 0; i < 5; i += 1) {
+    codes.push((await app.inject({ method: "GET", url: "/api/states/light.a", headers: limitedHeaders })).statusCode);
+  }
+  assert.deepEqual(codes.slice(0, 3), [200, 200, 200]);
+  assert.deepEqual(codes.slice(3), [429, 429]);
+  await resetSettings(prisma);
+});

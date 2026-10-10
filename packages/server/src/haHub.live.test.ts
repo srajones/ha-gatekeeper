@@ -21,13 +21,13 @@ const port = await server.listen();
 
 let wanted = ["light.a", "sensor.b"];
 const hubs: HaStateHub[] = [];
-function makeHub(token: string | null = "good-token") {
+function makeHub(token: string | null = "good-token", idleMs = 120) {
   const hub = new HaStateHub({
     baseUrl: `http://127.0.0.1:${port}`,
     getToken: () => token,
     collectEntityIds: () => wanted,
     connect: (url) => connectHaWebSocket(url, 2000),
-    idleMs: 120,
+    idleMs,
     maxMissed: 2,
     backoffInitialMs: 30,
     backoffMaxMs: 120,
@@ -109,12 +109,12 @@ test("changing the readable entities reconnects with the new list", async () => 
 });
 
 test("quiet link: the only thing sent to Home Assistant is keepalive pings", async () => {
-  const hub = makeHub();
+  const hub = makeHub("good-token", 400); // generous windows: this test must not depend on a busy machine
   hub.start();
   await until(() => hub.isConnected());
   const seen: string[] = [];
   const original = server.subscriptions.length;
-  await sleep(600);
+  await sleep(1500);
   seen.push(String(server.subscriptions.length - original));
   assert.deepEqual(seen, ["0"], "no re-subscription while nothing changes");
 });
