@@ -61,6 +61,10 @@ Assistant right now. The same data is at `GET /admin/connection` (admin session 
 | Link down and the option says "Report an error" | `503 {"ok":false,"error":"ha_unavailable"}` and `Retry-After: 5`. |
 | Entity removed from Home Assistant | The state becomes `unavailable` (the entity is never silently dropped). |
 | Key not allowed to read the entity | `403`, checked before any lookup, exactly as before. |
+| Home Assistant refuses the gateway's own token (HTTP 401/403 from it) | `502 {"ok":false,"error":"ha_unauthorized"}`, never a `401`, so a client with a good key does not think its key is wrong. The server log and the Activity page (`ha_unauthorized`) show the real cause: create a new long-lived token and run `sudo gatekeeper secrets` / re-run the installer. |
+| Home Assistant unreachable and no last known data | `502 {"ok":false,"error":"ha_state_proxy_failed"}` (fast: it never hangs on a dead address). |
+| Home Assistant answers any other error (404 unknown entity, 500 ...) | Its status and body are passed on and the Activity page shows `ha_request_failed:<status>`. Errors are never cached. |
+| Oversized request body | `413`. Odd paths or headers: `400`/`403`/`404`/`414`/`401`, never forwarded to Home Assistant. |
 
 After a service call the next reads ask Home Assistant directly for 1.5 seconds, so a client always sees the effect of
 its own call even though Home Assistant's change message is still on its way.
@@ -71,7 +75,11 @@ its own call even though Home Assistant's change message is still on its way.
 | --- | --- |
 | Home Assistant restarts or the network drops | Reconnects by itself: 5 s, then 10, 20, 40, up to 60 s between attempts; the wait resets once a connection lived for a minute. Reads follow the "When the live link is down" option meanwhile. |
 | A silent link (WiFi that dies without closing) | Every 20 s of silence a ping is sent; three silent windows in a row (about a minute) drop the socket and reconnect. Any message at all, not only a pong, proves the link alive. |
-| A broken or odd message | Skipped; the connection stays up. |
+| A broken or odd message (garbage, binary, wrong shape, unknown type, a 300 KB frame) | Skipped or handled; the connection stays up. |
+| Home Assistant accepts the socket but never answers (stuck while starting) | Each handshake step waits up to 10 s, then that attempt is dropped and retried with back-off. |
+| Home Assistant sends data for an entity nobody asked for | Ignored (it is not stored), so a misbehaving server cannot grow the process's memory. |
+| An entity that does not exist (yet) in Home Assistant | Not invented: reads for it ask Home Assistant the ordinary way (a real 404 if it is not there); it starts being served from memory as soon as Home Assistant announces it. |
+| Many keys changing at once (create, disable, delete) | A burst of changes collapses into a few reconnects ending with the final list. |
 | Home Assistant rejects the token | Retried with back-off; the card shows "Last problem: Home Assistant rejected the token". |
 | The token file changes | Picked up without a restart (the installer recreates the container when a secret changes). |
 | The list of watched entities cannot be built (database busy) | The error is logged, the last known data stays, the next attempt retries. |
@@ -97,6 +105,10 @@ its own call even though Home Assistant's change message is still on its way.
 
 - `packages/server/src/haHub.ts`: the websocket loop, the cache and the event handling. `haHubConnection.ts` is the real
   websocket behind the small `HubConnection` interface that the tests replace with scripts.
+- Edge-case suites: `haEdgeCases.test.ts` (the hub against awkward fake-Home-Assistant behaviour), `gatewayEdgeCases.test.ts`
+  (API key to fake Home Assistant: errors, a slow Home Assistant, 100 keys, hostile input) and `gatewayDown.test.ts`
+  (Home Assistant not there at all). `testHaSocket.ts` is the fake: it can refuse, hang, go silent, reject the token,
+  send garbage, binary and huge frames.
 - `packages/server/src/ha.ts`: the one gate to Home Assistant (limits, timeouts, shared answers, link-down policy).
   A test asserts that no other module opens its own connection: a new feature must read through this gate. To read a
   new entity, make a key's state permission include it; it is subscribed automatically.

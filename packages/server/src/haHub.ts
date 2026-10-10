@@ -64,6 +64,8 @@ export type HubOptions = {
   backoffMaxMs?: number;
   noTokenWaitMs?: number;
   emptyRecheckMs?: number;
+  // How long to wait for each step of the handshake (auth_required, auth_ok) before giving up on this attempt.
+  handshakeMs?: number;
 };
 
 export type HubStatus = {
@@ -132,6 +134,7 @@ export class HaStateHub {
   private readonly backoffMaxMs: number;
   private readonly noTokenWaitMs: number;
   private readonly emptyRecheckMs: number;
+  private readonly handshakeMs: number;
 
   constructor(private readonly options: HubOptions) {
     this.now = options.now ?? Date.now;
@@ -142,6 +145,7 @@ export class HaStateHub {
     this.backoffMaxMs = options.backoffMaxMs ?? 60_000;
     this.noTokenWaitMs = options.noTokenWaitMs ?? 60_000;
     this.emptyRecheckMs = options.emptyRecheckMs ?? 60_000;
+    this.handshakeMs = options.handshakeMs ?? 10_000;
   }
 
   // ---- reading -------------------------------------------------------------------------------
@@ -258,7 +262,9 @@ export class HaStateHub {
 
     if (isRecord(event.a)) {
       for (const [entityId, raw] of Object.entries(event.a)) {
-        if (!isRecord(raw)) {
+        // Only what was asked for: Home Assistant never sends anything else, and a misbehaving one must
+        // not be able to grow this process's memory.
+        if (!isRecord(raw) || !this.subscribed.has(entityId)) {
           continue;
         }
         const lastChanged = tsIso(raw.lc);
@@ -409,7 +415,7 @@ export class HaStateHub {
   }
 
   private async expectType(ws: HubConnection, type: string): Promise<Record<string, unknown>> {
-    const raw = await ws.recv(10_000);
+    const raw = await ws.recv(this.handshakeMs);
     if (raw === RECV_TIMEOUT) {
       throw new Error(`no ${type} from Home Assistant`);
     }

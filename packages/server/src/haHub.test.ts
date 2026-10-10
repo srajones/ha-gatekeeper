@@ -243,6 +243,7 @@ test("too many entities means no subscription at all (requests use the ordinary 
 test("the status report says what is going on without contacting Home Assistant", async () => {
   const { hub } = makeHub([]);
   assert.equal(hub.status().connected, false);
+  (hub as unknown as { subscribed: Set<string> }).subscribed = new Set(["light.a"]);
   hub.applyEvent({ a: { "light.a": { s: "on", a: {}, lc: Math.floor(Date.now() / 1000) - 30 } } });
   assert.equal(hub.status().cached, 1);
   assert.ok((hub.status().newestChangeAgeSeconds ?? 0) >= 29);

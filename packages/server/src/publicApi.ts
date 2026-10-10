@@ -35,6 +35,13 @@ function getAuthorizationHeader(headers: Record<string, string | string[] | unde
   return Array.isArray(authorization) ? authorization[0] : authorization;
 }
 
+// Home Assistant refusing the GATEWAY's own token is not the caller's fault: telling the caller "401" would
+// make a client with a perfectly good key believe its key is wrong. They get 502 ha_unauthorized instead,
+// and the real cause is in the server log.
+function isHaAuthFailure(status: number): boolean {
+  return status === 401 || status === 403;
+}
+
 export const publicApiRoutes: FastifyPluginAsync = async (app) => {
   app.addHook("onRequest", async (request, reply) => {
     if (isPublicApiAllowed({ addonMode: env.HA_GATEKEEPER_ADDON, exposeApi: env.ADDON_EXPOSE_API })) {
@@ -291,9 +298,13 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
           actionIdRaw,
           ip,
           success: haResponse.ok,
-          error: haResponse.ok ? null : `ha_request_failed:${haResponse.status}`
+          error: haResponse.ok ? null : isHaAuthFailure(haResponse.status) ? "ha_unauthorized" : `ha_request_failed:${haResponse.status}`
         });
 
+        if (isHaAuthFailure(haResponse.status)) {
+          request.log.error({ status: haResponse.status }, "ha_rejected_gateway_token");
+          return reply.status(502).send({ ok: false, error: "ha_unauthorized" });
+        }
         if (haResponse.contentType) {
           reply.header("content-type", haResponse.contentType);
         }
@@ -386,9 +397,13 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         actionIdRaw,
         ip,
         success: haResponse.ok,
-        error: haResponse.ok ? null : `ha_request_failed:${haResponse.status}`
+        error: haResponse.ok ? null : isHaAuthFailure(haResponse.status) ? "ha_unauthorized" : `ha_request_failed:${haResponse.status}`
       });
 
+      if (isHaAuthFailure(haResponse.status)) {
+        request.log.error({ status: haResponse.status }, "ha_rejected_gateway_token");
+        return reply.status(502).send({ ok: false, error: "ha_unauthorized" });
+      }
       if (haResponse.contentType) {
         reply.header("content-type", haResponse.contentType);
       }

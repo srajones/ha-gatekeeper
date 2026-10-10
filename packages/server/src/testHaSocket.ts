@@ -19,11 +19,22 @@ function frame(text: string): Buffer {
   if (length < 126) {
     return Buffer.concat([Buffer.from([0x81, length]), payload]);
   }
-  const header = Buffer.alloc(4);
+  if (length < 65536) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(10);
   header[0] = 0x81;
-  header[1] = 126;
-  header.writeUInt16BE(length, 2);
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(length), 2);
   return Buffer.concat([header, payload]);
+}
+
+function binaryFrame(payload: Buffer): Buffer {
+  return Buffer.concat([Buffer.from([0x82, payload.length]), payload]);
 }
 
 function* readFrames(buffer: Buffer): Generator<{ opcode: number; payload: Buffer; consumed: number }> {
@@ -59,6 +70,8 @@ export class FakeHaServer {
   subscriptions: string[][] = [];
   silent = false; // ignore everything the client sends: no pong, no events
   rejectAuth = false;
+  hangAuth = false; // accept the socket but never answer the auth message (Home Assistant stuck while starting)
+  failSubscribe = false; // answer subscribe_entities with success:false
   refuse = false; // refuse new websocket connections (Home Assistant restarting)
   private nextClientId = 1;
 
@@ -93,6 +106,15 @@ export class FakeHaServer {
     const delta: Record<string, unknown> = { "+": plus };
     if (minus) delta["-"] = minus;
     this.broadcast(entityId, { c: { [entityId]: delta } });
+  }
+
+  // Sends any text frame to every connected client, as is (garbage, huge frames, unknown types ...).
+  pushRaw(text: string): void {
+    for (const client of this.clients) client.socket.write(frame(text));
+  }
+
+  pushBinary(payload: Buffer): void {
+    for (const client of this.clients) client.socket.write(binaryFrame(payload));
   }
 
   pushRemoved(entityId: string): void {
@@ -148,7 +170,10 @@ export class FakeHaServer {
     }
     const send = (value: unknown) => client.socket.write(frame(JSON.stringify(value)));
     if (message.type === "auth") {
+      if (this.hangAuth) return;
       send({ type: !this.rejectAuth && message.access_token === this.token ? "auth_ok" : "auth_invalid", ha_version: "2026.9.0" });
+    } else if (message.type === "subscribe_entities" && this.failSubscribe) {
+      send({ id: message.id, type: "result", success: false, error: { code: "invalid_format", message: "nope" } });
     } else if (message.type === "subscribe_entities") {
       client.subscribed = true;
       client.ids = message.entity_ids ?? [];
