@@ -5,6 +5,7 @@ import { AppShell, type Tab } from "./components/AppShell";
 import { LoginCard } from "./components/LoginCard";
 import { ActivityPage } from "./pages/ActivityPage";
 import { QuickStartPage } from "./pages/QuickStartPage";
+import { SettingsPage } from "./pages/SettingsPage";
 import { TokensPage } from "./pages/TokensPage";
 
 export default function App() {
@@ -45,6 +46,35 @@ export default function App() {
     queryKey: ["ha-entities"],
     queryFn: () => api.haEntities(),
     enabled: authenticated
+  });
+
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: api.settings,
+    enabled: authenticated && tab === "Settings"
+  });
+
+  const connectionQuery = useQuery({
+    queryKey: ["connection"],
+    queryFn: api.connection,
+    enabled: authenticated && tab === "Settings",
+    refetchInterval: 5000
+  });
+
+  const saveSettingsMutation = useMutation({
+    mutationFn: api.saveSettings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+      queryClient.invalidateQueries({ queryKey: ["connection"] });
+    }
+  });
+
+  const resetSettingsMutation = useMutation({
+    mutationFn: api.resetSettings,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+      queryClient.invalidateQueries({ queryKey: ["connection"] });
+    }
   });
 
   const loginMutation = useMutation<{}, ApiError, string>({
@@ -159,6 +189,21 @@ export default function App() {
       ) : null}
 
       {tab === "Activity" ? <ActivityPage logs={auditQuery.data?.logs ?? []} /> : null}
+
+      {tab === "Settings" ? (
+        <SettingsPage
+          settings={settingsQuery.data?.settings ?? null}
+          defaults={settingsQuery.data?.defaults ?? null}
+          help={settingsQuery.data?.help ?? []}
+          connection={connectionQuery.data ?? null}
+          isLoading={settingsQuery.isLoading}
+          hasError={settingsQuery.isError}
+          isSaving={saveSettingsMutation.isPending || resetSettingsMutation.isPending}
+          saveError={saveSettingsMutation.error ?? resetSettingsMutation.error}
+          onSave={(patch) => saveSettingsMutation.mutate(patch)}
+          onReset={() => resetSettingsMutation.mutate()}
+        />
+      ) : null}
     </AppShell>
   );
 }

@@ -3,7 +3,7 @@ import { useTheme } from "../lib/theme";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 
-export const tabs = ["Quick Start", "Tokens", "Activity"] as const;
+export const tabs = ["Quick Start", "Tokens", "Activity", "Settings"] as const;
 export type Tab = (typeof tabs)[number];
 
 type AppShellProps = {

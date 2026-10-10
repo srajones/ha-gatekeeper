@@ -58,6 +58,41 @@ export type QuickSetupResult = {
   apiKey: string;
 };
 
+export type GatewaySettings = {
+  stateSource: "subscription" | "cache" | "direct";
+  cacheMs: number;
+  maxConcurrency: number;
+  onLinkDown: "live-then-last-known" | "last-known" | "error";
+  rateLimitPerMinute: number;
+};
+
+export type SettingHelp = {
+  key: keyof GatewaySettings;
+  label: string;
+  summary: string;
+  detail: string;
+  choices?: Array<{ value: string; label: string; description: string }>;
+  unit?: string;
+  min?: number;
+  max?: number;
+};
+
+export type ConnectionStatus = {
+  settings: GatewaySettings;
+  live: {
+    running: boolean;
+    connected: boolean;
+    subscribed: number;
+    cached: number;
+    newestChangeAgeSeconds: number | null;
+    lastEventAt: string | null;
+    connectedSince: string | null;
+    reconnects: number;
+    lastError: string | null;
+  };
+  requests: { inFlight: number; waiting: number };
+};
+
 type ApiResponse<T> = {
   ok: boolean;
 } & T;
@@ -151,6 +186,15 @@ export const api = {
     apiFetch<{}>(`/admin/clients/${clientId}`, {
       method: "DELETE"
     }),
+  settings: () =>
+    apiFetch<{ settings: GatewaySettings; defaults: GatewaySettings; help: SettingHelp[] }>("/admin/settings"),
+  saveSettings: (patch: Partial<GatewaySettings>) =>
+    apiFetch<{ settings: GatewaySettings }>("/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify(patch)
+    }),
+  resetSettings: () => apiFetch<{ settings: GatewaySettings }>("/admin/settings/reset", { method: "POST" }),
+  connection: () => apiFetch<ConnectionStatus>("/admin/connection"),
   auditLogs: () => apiFetch<{ logs: AuditLog[] }>("/admin/audit-logs"),
   haServices: () => apiFetch<{ services: HaServiceCatalog[]; cached?: boolean }>(
     "/admin/ha/services"
