@@ -84,6 +84,29 @@ fi
 host_is_self 8.8.8.8 && t "foreign ip not self" 1 0 || t "foreign ip not self" 1 1
 host_is_self "" && t "empty not self" 1 0 || t "empty not self" 1 1
 
+echo "derive_config: private mode behind your own HTTPS web server"
+declare -A CFG=()
+cfg_defaults
+CFG[GATEKEEPER_MODE]=local; CFG[HA_BASE_URL]=https://abc.ui.nabu.casa; CFG[GATEKEEPER_PORT]=8080
+CFG[GATEKEEPER_PUBLIC_URL]="https://ha.example.com/some/path"; derive_config
+t "public url reduced to the origin" "https://ha.example.com" "${CFG[GATEKEEPER_PUBLIC_URL]}"
+t "CORS origin follows" "https://ha.example.com" "${CFG[CORS_ORIGIN]}"
+t "one trusted proxy hop" "1" "${CFG[TRUST_PROXY]}"
+t "no proxy profile (we never start Caddy here)" "" "${CFG[COMPOSE_PROFILES]}"
+CFG[GATEKEEPER_PUBLIC_URL]="http://ha.example.com"; derive_config
+t "plain http is not accepted as a public address" "http://localhost:8080" "${CFG[GATEKEEPER_PUBLIC_URL]}"
+t "and trusts no proxy" "" "${CFG[TRUST_PROXY]}"
+CFG[GATEKEEPER_PUBLIC_URL]=""; derive_config
+t "default private mode" "http://localhost:8080" "${CFG[GATEKEEPER_PUBLIC_URL]}"
+CFG[GATEKEEPER_MODE]=domain; CFG[GATEKEEPER_DOMAIN]=gk.example.com; CFG[GATEKEEPER_PUBLIC_URL]="https://other.example.com"; derive_config
+t "HTTPS modes derive their own public url" "https://gk.example.com" "${CFG[GATEKEEPER_PUBLIC_URL]}"
+
+echo "secret generators work without openssl"
+t "alnum length" 24 "$(gen_alnum 24 | wc -c)"
+t "session secret is 32 bytes of base64" 44 "$(gen_session_secret | wc -c)"
+t "hash secret has no padding or url-unsafe characters" "" "$(gen_hash_secret | tr -d 'A-Za-z0-9_-')"
+t "two secrets differ" "different" "$([[ "$(gen_hash_secret)" != "$(gen_hash_secret)" ]] && echo different || echo same)"
+
 echo "token_problem / password_problem"
 GOOD_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhYmMifQ.abcDEF-_123"
 t "good token" "" "$(token_problem "$GOOD_TOKEN")"
