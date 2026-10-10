@@ -1,8 +1,7 @@
-import { env } from "./env.js";
 import { getAlertConfig } from "./alertConfig.js";
 import { AlertManager, sendAlert, safeError, type AlertMessage, type ChannelResult } from "./alerts.js";
 import { haHub } from "./hubRuntime.js";
-import { getHaToken } from "./haToken.js";
+import { probeHomeAssistant } from "./ha.js";
 import { getSettings } from "./settings.js";
 
 // Watches the connection to Home Assistant and raises the alert when it stays down (see alerts.ts for the rules).
@@ -13,33 +12,7 @@ import { getSettings } from "./settings.js";
 // Either way the AlertManager gets the same report, so the behaviour is identical in every mode.
 
 const PROBE_EVERY_MS = 60_000;
-const PROBE_TIMEOUT_MS = 8_000;
 const TICK_MS = 5_000;
-
-export type ProbeResult = { up: boolean; reason?: string };
-
-export async function probeHomeAssistant(fetchImpl: typeof fetch = fetch): Promise<ProbeResult> {
-  try {
-    const res = await fetchImpl(`${env.HA_BASE_URL.replace(/\/$/, "")}/api/`, {
-      headers: { Authorization: `Bearer ${getHaToken()}` },
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
-    });
-    if (res.ok) {
-      return { up: true };
-    }
-    if (res.status === 401 || res.status === 403) {
-      return { up: false, reason: `Home Assistant rejected the access token (HTTP ${res.status})` };
-    }
-    return { up: false, reason: `Home Assistant answered HTTP ${res.status}` };
-  } catch (error) {
-    const name = (error as Error)?.name;
-    if (name === "TimeoutError" || name === "AbortError") {
-      return { up: false, reason: `no answer from Home Assistant within ${PROBE_TIMEOUT_MS / 1000} s` };
-    }
-    const code = ((error as { cause?: { code?: string } })?.cause?.code) ?? (error as { code?: string })?.code;
-    return { up: false, reason: `cannot connect to Home Assistant${code ? ` (${code})` : ""}` };
-  }
-}
 
 export const alertManager = new AlertManager({
   send: (message: AlertMessage): Promise<ChannelResult[]> => sendAlert(getAlertConfig(), message),
@@ -99,4 +72,4 @@ export async function sendTestAlert(): Promise<ChannelResult[]> {
   });
 }
 
-export { safeError };
+export { safeError, probeHomeAssistant };

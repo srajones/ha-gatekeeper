@@ -131,14 +131,14 @@ test("the live link keeps retrying quietly (backoff), it does not spin", async (
 
 test("probe: every kind of failure is described in plain words", async () => {
   const reply = (status: number) => async () => new Response("x", { status });
-  assert.deepEqual(await probeHomeAssistant(reply(200) as unknown as typeof fetch), { up: true });
-  assert.match((await probeHomeAssistant(reply(401) as unknown as typeof fetch)).reason!, /rejected the access token \(HTTP 401\)/);
-  assert.match((await probeHomeAssistant(reply(403) as unknown as typeof fetch)).reason!, /rejected the access token/);
-  assert.match((await probeHomeAssistant(reply(502) as unknown as typeof fetch)).reason!, /HTTP 502/);
+  assert.deepEqual(await probeHomeAssistant(reply(200)), { up: true });
+  assert.match((await probeHomeAssistant(reply(401))).reason!, /rejected the access token \(HTTP 401\)/);
+  assert.match((await probeHomeAssistant(reply(403))).reason!, /rejected the access token/);
+  assert.match((await probeHomeAssistant(reply(502))).reason!, /HTTP 502/);
   const refused = async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }); };
-  assert.match((await probeHomeAssistant(refused as unknown as typeof fetch)).reason!, /cannot connect to Home Assistant \(ECONNREFUSED\)/);
+  assert.match((await probeHomeAssistant(refused)).reason!, /cannot connect to Home Assistant \(ECONNREFUSED\)/);
   const timeout = async () => { throw Object.assign(new Error("timed out"), { name: "TimeoutError" }); };
-  assert.match((await probeHomeAssistant(timeout as unknown as typeof fetch)).reason!, /no answer from Home Assistant within 8 s/);
+  assert.match((await probeHomeAssistant(timeout)).reason!, /no answer from Home Assistant within 8 s/);
   const real = await probeHomeAssistant();
   assert.equal(real.up, false);
   assert.match(real.reason!, /cannot connect/);

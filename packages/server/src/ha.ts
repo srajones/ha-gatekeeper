@@ -204,3 +204,38 @@ export async function fetchHaEntities(): Promise<HaEntity[]> {
     return { entityId, domain, name };
   });
 }
+
+const PROBE_TIMEOUT_MS = 8_000;
+
+// One tiny authenticated request (GET /api/) used by the alert monitor when the live subscription is not
+// the thing being watched. Never goes through the limiter or the cache: it must report the truth.
+export type ProbeResult = { up: boolean; reason?: string };
+
+type ProbeFetch = (
+  url: string,
+  init: { headers: Record<string, string>; signal: AbortSignal }
+) => Promise<{ ok: boolean; status: number }>;
+
+export async function probeHomeAssistant(fetchImpl: ProbeFetch = fetch): Promise<ProbeResult> {
+  try {
+    const res = await fetchImpl(`${baseUrl}/api/`, {
+      headers: { Authorization: `Bearer ${getHaToken()}` },
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
+    });
+    if (res.ok) {
+      return { up: true };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { up: false, reason: `Home Assistant rejected the access token (HTTP ${res.status})` };
+    }
+    return { up: false, reason: `Home Assistant answered HTTP ${res.status}` };
+  } catch (error) {
+    const name = (error as Error)?.name;
+    if (name === "TimeoutError" || name === "AbortError") {
+      return { up: false, reason: `no answer from Home Assistant within ${PROBE_TIMEOUT_MS / 1000} s` };
+    }
+    const code = ((error as { cause?: { code?: string } })?.cause?.code) ?? (error as { code?: string })?.code;
+    return { up: false, reason: `cannot connect to Home Assistant${code ? ` (${code})` : ""}` };
+  }
+}
+
