@@ -10,6 +10,7 @@ A single-container API gateway for Home Assistant that issues limited, audited b
 - Editable token permissions after a token has been issued
 - Quick Start admin flow for creating scoped access without manual policy setup
 - Audit log storage and query
+- Self-healing and always on, with alerts (e-mail, webhook, ntfy, Telegram, heartbeat) when Home Assistant or the server goes down: see [docs/ALERTS.md](docs/ALERTS.md)
 - Admin dashboard with session login and optional two-factor (TOTP + recovery codes), see [docs/TWO_FACTOR.md](docs/TWO_FACTOR.md)
 - One live websocket to Home Assistant for all keys (answers from memory, minimal load), with behaviour chosen in the dashboard Settings
 - Secrets mounted as files, never as container environment variables (VPS installer)

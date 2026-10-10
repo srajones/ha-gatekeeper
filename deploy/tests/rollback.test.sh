@@ -380,7 +380,12 @@ run_case secrets '
   echo "token-file: $(stat -c "%a" "$APP_DIR/secrets/ha_token")"
   echo "pw-roundtrip: [$(cat "$APP_DIR/secrets/admin_password")]"
   echo "changed1: $SECRETS_CHANGED"
+  echo "optional-files: $(for f in alert_webhook_url smtp_password alert_ntfy_token alert_telegram_bot_token; do [[ -f "$APP_DIR/secrets/$f" && ! -s "$APP_DIR/secrets/$f" ]] && printf "%s=empty " "$f"; done)"
+  echo "optional-mode: $(stat -c "%a" "$APP_DIR/secrets/smtp_password")"
   SECRETS_CHANGED=false; sync_secret_files; echo "changed2: $SECRETS_CHANGED"
+  CFG[SMTP_PASSWORD]="smtp pass \"q\" \\ 1"; SECRETS_CHANGED=false; sync_secret_files; echo "smtp-changed: $SECRETS_CHANGED roundtrip: [$(cat "$APP_DIR/secrets/smtp_password")]"
+  CFG[SMTP_PASSWORD]=""; SECRETS_CHANGED=false; sync_secret_files; echo "smtp-cleared: $SECRETS_CHANGED size: $(stat -c %s "$APP_DIR/secrets/smtp_password")"
+  SECRETS_CHANGED=false; sync_secret_files
   mkdir "$APP_DIR/secrets/ha_token.d"; rm -rf "$APP_DIR/secrets/ha_token"; mkdir "$APP_DIR/secrets/ha_token"
   sync_secret_files; echo "dir-replaced: $([[ -f "$APP_DIR/secrets/ha_token" ]] && echo yes)"
   exit 1
@@ -391,6 +396,10 @@ ck "special characters survive byte for byte" out_has 'pw-roundtrip: [p@ss $+wor
 ck "first write flags a recreate" out_has "changed1: true"
 ck "unchanged secrets do not flag a recreate" out_has "changed2: false"
 ck "a folder Docker created in place of a missing file is replaced" out_has "dir-replaced: yes"
+ck "optional secret files exist (empty) so Docker never creates folders in their place" out_has "optional-files: alert_webhook_url=empty smtp_password=empty alert_ntfy_token=empty alert_telegram_bot_token=empty"
+ck "optional secret files are private too" out_has "optional-mode: 400"
+ck "an optional secret changes and flags a recreate; odd characters survive" out_has 'smtp-changed: true roundtrip: [smtp pass "q" \ 1]'
+ck "clearing an optional secret empties the file and flags a recreate" out_has "smtp-cleared: true size: 0"
 ck "secrets folder removed by rollback (it was created by this run)" test ! -e "$T/app/secrets"
 
 echo "the compose file passes no secret as an environment variable"
@@ -495,6 +504,34 @@ run_case emptydiscard '
   journal_rollback
 '
 ck "a declined run (log discarded) claims no kept log" bash -c "! grep -q 'Kept for you' '$CASE_OUT'"
+
+echo "alert settings are validated (a half-filled channel is a mistake worth stopping on)"
+run_case alertcfg '
+  cfg_defaults
+  echo "none: [$(alert_problems)]"
+  CFG[ALERT_EMAIL_TO]="a@b.co, bad"; CFG[SMTP_HOST]="smtp.x.org"; CFG[SMTP_PORT]="70000"; CFG[SMTP_SECURITY]="ssl"; CFG[SMTP_USER]="u"
+  echo "bad-email: [$(alert_problems | tr "\n" "|")]"
+  CFG[ALERT_EMAIL_TO]="a@b.co,c@d.org"; CFG[SMTP_PORT]="465"; CFG[SMTP_SECURITY]="tls"; CFG[SMTP_USER]="alerts@x.org"; CFG[SMTP_PASSWORD]="pw"
+  echo "good-email: [$(alert_problems)]"
+  CFG[SMTP_PASSWORD]=""; echo "no-password: [$(alert_problems)]"
+  CFG[SMTP_PASSWORD]="pw"; CFG[SMTP_HOST]=""; echo "no-host: [$(alert_problems)]"
+  CFG[SMTP_HOST]="h.x.org"
+  CFG[ALERT_TELEGRAM_BOT_TOKEN]="nope"; CFG[ALERT_TELEGRAM_CHAT_ID]="abc"; echo "tg-bad: [$(alert_problems | tr "\n" "|")]"
+  CFG[ALERT_TELEGRAM_BOT_TOKEN]="123456:ABC-def_1"; CFG[ALERT_TELEGRAM_CHAT_ID]="-100123"; echo "tg-good: [$(alert_problems)]"
+  CFG[ALERT_NTFY_URL]="ftp://x"; CFG[HEARTBEAT_URL]="not a url"; echo "urls: [$(alert_problems | tr "\n" "|")]"
+  CFG[ALERT_NTFY_URL]="https://ntfy.sh/topic"; CFG[HEARTBEAT_URL]="https://hc-ping.com/abc"; echo "urls-good: [$(alert_problems)]"
+  echo "text: $(alerts_configured_text)"
+'
+ck "nothing set is fine" out_has "none: []"
+ck "a bad address, port and security are all named" bash -c "grep -q 'bad-email: .*not an e-mail address.*SMTP_PORT.*SMTP_SECURITY' '$CASE_OUT'"
+ck "a complete e-mail setup passes" out_has "good-email: []"
+ck "a login without a password is caught" out_has "no-password: [SMTP_USER is set but SMTP_PASSWORD is empty]"
+ck "a missing server is caught" out_has "no-host: [ALERT_EMAIL_TO is set but SMTP_HOST is empty]"
+ck "a wrong Telegram token and chat id are caught" bash -c "grep -q 'tg-bad: .*TELEGRAM_BOT_TOKEN.*CHAT_ID' '$CASE_OUT'"
+ck "a good Telegram setup passes" out_has "tg-good: []"
+ck "bad ntfy and heartbeat URLs are caught" bash -c "grep -q 'urls: .*ALERT_NTFY_URL.*HEARTBEAT_URL' '$CASE_OUT'"
+ck "good URLs pass" out_has "urls-good: []"
+ck "the summary lists every configured channel" out_has "text: e-mail, ntfy, Telegram, heartbeat"
 
 echo "admin_login understands the two-factor step (verify and update must not fail when it is on)"
 run_case adminlogin2fa '

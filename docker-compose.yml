@@ -39,6 +39,18 @@ services:
     restart: unless-stopped
     # tini as PID 1: forwards signals (fast, clean stops) and reaps zombie processes.
     init: true
+    # The app closes the database cleanly on SIGTERM; give it time, but never let a stop hang.
+    stop_grace_period: 20s
+    # Fences, not a diet: this server needs a small fraction of these. They stop a runaway process from
+    # taking the rest of the machine (your other containers!) down with it; Docker then restarts it
+    # (restart policy above) and the watchdog tells you. Raise them in .env if you ever need to.
+    mem_limit: "${GATEKEEPER_MEM_LIMIT:-768m}"
+    memswap_limit: "${GATEKEEPER_MEM_LIMIT:-768m}"
+    pids_limit: 512
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     environment:
       NODE_ENV: production
       PORT: "8080"
@@ -56,6 +68,21 @@ services:
       TRUST_PROXY: "${TRUST_PROXY:-}"
       # Optional: trust a private CA for Home Assistant (path inside the container, under /certs).
       NODE_EXTRA_CA_CERTS: "${HA_CA_CERT:-}"
+      # Alerts when Home Assistant is unreachable (see docs/ALERTS.md). All optional. The secret parts are
+      # files below, like the other secrets; an empty file means "not set".
+      ALERT_NAME: "${ALERT_NAME:-}"
+      ALERT_EMAIL_TO: "${ALERT_EMAIL_TO:-}"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-}"
+      SMTP_SECURITY: "${SMTP_SECURITY:-}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_FROM: "${SMTP_FROM:-}"
+      ALERT_NTFY_URL: "${ALERT_NTFY_URL:-}"
+      ALERT_TELEGRAM_CHAT_ID: "${ALERT_TELEGRAM_CHAT_ID:-}"
+      ALERT_WEBHOOK_URL_FILE: /run/secrets/alert_webhook_url
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      ALERT_NTFY_TOKEN_FILE: /run/secrets/alert_ntfy_token
+      ALERT_TELEGRAM_BOT_TOKEN_FILE: /run/secrets/alert_telegram_bot_token
     ports:
       - "${GATEKEEPER_BIND:-127.0.0.1}:${GATEKEEPER_PORT:-8080}:8080"
     volumes:
@@ -68,6 +95,10 @@ services:
       - "./secrets/admin_password:/run/secrets/admin_password:ro,z"
       - "./secrets/admin_session_secret:/run/secrets/admin_session_secret:ro,z"
       - "./secrets/api_key_hash_secret:/run/secrets/api_key_hash_secret:ro,z"
+      - "./secrets/alert_webhook_url:/run/secrets/alert_webhook_url:ro,z"
+      - "./secrets/smtp_password:/run/secrets/smtp_password:ro,z"
+      - "./secrets/alert_ntfy_token:/run/secrets/alert_ntfy_token:ro,z"
+      - "./secrets/alert_telegram_bot_token:/run/secrets/alert_telegram_bot_token:ro,z"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -90,9 +121,13 @@ services:
     container_name: ha-gatekeeper-caddy
     profiles: ["proxy"]
     restart: unless-stopped
+    mem_limit: "${CADDY_MEM_LIMIT:-384m}"
+    memswap_limit: "${CADDY_MEM_LIMIT:-384m}"
+    pids_limit: 512
+    stop_grace_period: 20s
     depends_on:
       gatekeeper:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "80:80"
       - "443:443"

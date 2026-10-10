@@ -1212,6 +1212,8 @@ CFG_KEYS=(
   HA_BASE_URL HA_TOKEN ADMIN_PASSWORD ADMIN_SESSION_SECRET API_KEY_HASH_SECRET
   CORS_ORIGIN TRUST_PROXY AUDIT_LOG_RETENTION_DAYS LOG_LEVEL HA_CA_CERT
   ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL
+  ALERT_NAME ALERT_EMAIL_TO SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USER SMTP_PASSWORD SMTP_FROM
+  ALERT_NTFY_URL ALERT_NTFY_TOKEN ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID HEARTBEAT_URL
 )
 
 # Only these may come from the process environment. Deliberately not COMPOSE_*, LOG_LEVEL or
@@ -1220,6 +1222,8 @@ ENV_ACCEPTED_KEYS=(
   GATEKEEPER_MODE GATEKEEPER_DOMAIN ACME_EMAIL HA_BASE_URL HA_TOKEN ADMIN_PASSWORD
   ADMIN_SESSION_SECRET API_KEY_HASH_SECRET AUDIT_LOG_RETENTION_DAYS
   ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL GATEKEEPER_PORT GATEKEEPER_DATA_DIR GATEKEEPER_PUBLIC_URL
+  ALERT_NAME ALERT_EMAIL_TO SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USER SMTP_PASSWORD SMTP_FROM
+  ALERT_NTFY_URL ALERT_NTFY_TOKEN ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID HEARTBEAT_URL
 )
 
 # Keys that are only meaningful inside the compose project itself; empty ones are not written.
@@ -1365,6 +1369,33 @@ config_problems() {
   if [[ -n "${CFG[ADMIN_ALLOWED_IPS]:-}" ]] && ! normalize_ip_list "${CFG[ADMIN_ALLOWED_IPS]}" >/dev/null; then
     echo "ADMIN_ALLOWED_IPS must be a list of IPs/CIDRs"
   fi
+  alert_problems
+  return 0
+}
+
+# Alert settings are optional, but a half-filled channel is a mistake worth stopping on.
+alert_problems() {
+  local a addr
+  if [[ -n "${CFG[ALERT_EMAIL_TO]:-}${CFG[SMTP_HOST]:-}" ]]; then
+    [[ -n "${CFG[ALERT_EMAIL_TO]:-}" ]] || echo "SMTP_HOST is set but ALERT_EMAIL_TO is empty"
+    [[ -n "${CFG[SMTP_HOST]:-}" ]] || echo "ALERT_EMAIL_TO is set but SMTP_HOST is empty"
+    IFS=',' read -r -a a <<<"${CFG[ALERT_EMAIL_TO]:-}"
+    for addr in "${a[@]}"; do
+      addr="$(trim "$addr")"
+      [[ -z "$addr" ]] || is_email "$addr" || echo "ALERT_EMAIL_TO: '$addr' is not an e-mail address"
+    done
+    if [[ -n "${CFG[SMTP_PORT]:-}" ]] && { ! is_uint "${CFG[SMTP_PORT]}" || (( CFG[SMTP_PORT] < 1 || CFG[SMTP_PORT] > 65535 )); }; then echo "SMTP_PORT must be 1-65535"; fi
+    case "${CFG[SMTP_SECURITY]:-starttls}" in starttls|tls|none) ;; *) echo "SMTP_SECURITY must be starttls, tls or none" ;; esac
+    local from="${CFG[SMTP_FROM]:-${CFG[SMTP_USER]:-}}"
+    is_email "$from" || echo "SMTP_FROM (the sender address) is missing or not an e-mail address"
+    [[ -z "${CFG[SMTP_USER]:-}" || -n "${CFG[SMTP_PASSWORD]:-}" ]] || echo "SMTP_USER is set but SMTP_PASSWORD is empty"
+  fi
+  if [[ -n "${CFG[ALERT_NTFY_URL]:-}" ]] && ! is_safe_url "${CFG[ALERT_NTFY_URL]}"; then echo "ALERT_NTFY_URL must be a plain http(s) URL"; fi
+  if [[ -n "${CFG[ALERT_TELEGRAM_BOT_TOKEN]:-}${CFG[ALERT_TELEGRAM_CHAT_ID]:-}" ]]; then
+    [[ "${CFG[ALERT_TELEGRAM_BOT_TOKEN]:-}" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || echo "ALERT_TELEGRAM_BOT_TOKEN looks wrong (it is like 123456:ABC-DEF...)"
+    [[ "${CFG[ALERT_TELEGRAM_CHAT_ID]:-}" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || echo "ALERT_TELEGRAM_CHAT_ID must be a number (or @channelname)"
+  fi
+  if [[ -n "${CFG[HEARTBEAT_URL]:-}" ]] && ! is_safe_url "${CFG[HEARTBEAT_URL]}"; then echo "HEARTBEAT_URL must be a plain http(s) URL"; fi
   return 0
 }
 
@@ -1423,16 +1454,21 @@ write_env_file() {
 # before every start. The folder is root-only; each file is readable by the app's user only.
 SECRETS_CHANGED=false   # a secret file was (re)written: a running container must be recreated to see it
 SECRET_FILE_MAP=(HA_TOKEN:ha_token ADMIN_PASSWORD:admin_password ADMIN_SESSION_SECRET:admin_session_secret API_KEY_HASH_SECRET:api_key_hash_secret)
+# Optional secrets: the files always exist (an empty file means "not set") because Docker would create a folder
+# in place of a missing bind-mount source.
+OPTIONAL_SECRET_FILE_MAP=(ALERT_WEBHOOK_URL:alert_webhook_url SMTP_PASSWORD:smtp_password ALERT_NTFY_TOKEN:alert_ntfy_token ALERT_TELEGRAM_BOT_TOKEN:alert_telegram_bot_token)
 sync_secret_files() {
-  local dir="$APP_DIR/secrets" pair key name val path tmp dir_new=false
+  local dir="$APP_DIR/secrets" pair key name val path tmp dir_new=false optional
   [[ -d "$dir" ]] || dir_new=true
   jx_mkdir "$dir" tree
   chown root:root "$dir" 2>/dev/null || true
   chmod 700 "$dir"
-  for pair in "${SECRET_FILE_MAP[@]}"; do
+  for pair in "${SECRET_FILE_MAP[@]}" "${OPTIONAL_SECRET_FILE_MAP[@]}"; do
     key="${pair%%:*}"; name="${pair#*:}"
     val="${CFG[$key]:-}"
-    if [[ -z "$val" ]]; then
+    optional=false
+    case " ${OPTIONAL_SECRET_FILE_MAP[*]} " in *" $pair "*) optional=true ;; esac
+    if [[ -z "$val" ]] && ! $optional; then
       err "$key is empty, so secrets/$name cannot be written."
       return 1
     fi
@@ -1442,6 +1478,7 @@ sync_secret_files() {
       rmdir "$path" 2>/dev/null || { err "$path is a folder and not empty; remove it and re-run."; return 1; }
     fi
     if [[ ! -f "$path" || "$(cat "$path" 2>/dev/null)" != "$val" ]]; then
+      # (an existing file that already holds exactly this value is left alone)
       $dir_new || [[ -e "$path" ]] || jpush "Created $path" rv_rm "$path"
       tmp="$(mktemp "$dir/.s.XXXXXX")"
       printf '%s' "$val" >"$tmp"
@@ -2740,7 +2777,7 @@ verify_secrets() {
   local env_json key leaked=() dir="$APP_DIR/secrets"
   env_json="$(docker inspect --type container -f '{{json .Config.Env}}' "$GK_CONTAINER" 2>/dev/null || true)"
   if [[ -n "$env_json" ]]; then
-    for key in HA_TOKEN ADMIN_PASSWORD ADMIN_SESSION_SECRET API_KEY_HASH_SECRET; do
+    for key in HA_TOKEN ADMIN_PASSWORD ADMIN_SESSION_SECRET API_KEY_HASH_SECRET ALERT_WEBHOOK_URL SMTP_PASSWORD ALERT_NTFY_TOKEN ALERT_TELEGRAM_BOT_TOKEN; do
       if grep -qF "\"$key=" <<<"$env_json"; then leaked+=("$key"); fi
     done
     if (( ${#leaked[@]} > 0 )); then
@@ -3584,6 +3621,108 @@ wizard_admin_password() {
   esac
 }
 
+# Names of the alert channels that have settings, for display.
+alerts_configured_text() {
+  local names=()
+  [[ -n "${CFG[ALERT_EMAIL_TO]:-}" && -n "${CFG[SMTP_HOST]:-}" ]] && names+=("e-mail")
+  [[ -n "${CFG[ALERT_WEBHOOK_URL]:-}" ]] && names+=("webhook")
+  [[ -n "${CFG[ALERT_NTFY_URL]:-}" ]] && names+=("ntfy")
+  [[ -n "${CFG[ALERT_TELEGRAM_BOT_TOKEN]:-}" ]] && names+=("Telegram")
+  [[ -n "${CFG[HEARTBEAT_URL]:-}" ]] && names+=("heartbeat")
+  if (( ${#names[@]} == 0 )); then printf 'none'; else local IFS=,; printf '%s' "${names[*]}" | sed 's/,/, /g'; fi
+}
+
+# Ask for one value until it passes CHECK (a function name); Enter keeps the current value, "-" clears it.
+alert_ask() { # alert_ask KEY "Prompt" CHECKFN "complaint" [secret]
+  local key="$1" prompt="$2" check="$3" complaint="$4" secret="${5:-}" v cur="${CFG[$1]:-}"
+  while true; do
+    if [[ -n "$secret" ]]; then
+      v="$(ask_secret "$prompt${cur:+ (Enter keeps the saved one, - clears)}")"
+      [[ -n "$v" ]] || v="$cur"
+    else
+      v="$(ask "$prompt${cur:+ (- clears)}" "$cur")"
+    fi
+    if [[ "$v" == "-" ]]; then CFG[$key]=""; return 0; fi
+    if [[ -z "$v" || "$v" == *$'\n'* ]] && [[ -n "$v" ]]; then warn "No line breaks, please."; continue; fi
+    if [[ -z "$v" ]] || "$check" "$v"; then CFG[$key]="$v"; return 0; fi
+    warn "$complaint"
+  done
+}
+
+is_smtp_port() { is_uint "$1" && (( $1 >= 1 && $1 <= 65535 )); }
+is_email_list() {
+  local a addr
+  IFS=',' read -r -a a <<<"$1"
+  (( ${#a[@]} > 0 )) || return 1
+  for addr in "${a[@]}"; do addr="$(trim "$addr")"; is_email "$addr" || return 1; done
+}
+is_telegram_token() { [[ "$1" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; }
+is_telegram_chat() { [[ "$1" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]]; }
+is_any_text() { return 0; }
+
+wizard_alert_email() {
+  local v
+  say "  ${C_DIM}E-mail needs an SMTP server that accepts your login (your provider's, Gmail with an app password, Mailgun, Brevo ...).${C_RESET}"
+  say "  ${C_DIM}Some VPS providers block outgoing mail on port 25; ports 587 or 465 normally work.${C_RESET}"
+  alert_ask ALERT_EMAIL_TO "Send alerts to (e-mail address, several separated by commas)" is_email_list "That is not an e-mail address (or a comma-separated list of them)."
+  if [[ -z "${CFG[ALERT_EMAIL_TO]}" ]]; then CFG[SMTP_HOST]=""; return 0; fi
+  alert_ask SMTP_HOST "SMTP server (for example smtp.gmail.com)" is_domain_or_ip "That does not look like a server name."
+  [[ -n "${CFG[SMTP_PORT]:-}" ]] || CFG[SMTP_PORT]="587"
+  alert_ask SMTP_PORT "SMTP port" is_smtp_port "Please enter a port number (587 for STARTTLS, 465 for TLS, 25 for plain)."
+  say "    1) STARTTLS (port 587, most common)   2) TLS (port 465)   3) none (port 25, only for your own mail relay)"
+  v="$(ask "Connection security [1/2/3]" "$(case "${CFG[SMTP_SECURITY]:-starttls}" in tls) echo 2 ;; none) echo 3 ;; *) echo 1 ;; esac)")"
+  case "$v" in 2|tls) CFG[SMTP_SECURITY]="tls" ;; 3|none) CFG[SMTP_SECURITY]="none" ;; *) CFG[SMTP_SECURITY]="starttls" ;; esac
+  alert_ask SMTP_USER "SMTP login (user name; Enter if your server needs none)" is_any_text "x"
+  if [[ -n "${CFG[SMTP_USER]}" ]]; then
+    alert_ask SMTP_PASSWORD "SMTP password" is_any_text "x" secret
+  else
+    CFG[SMTP_PASSWORD]=""
+  fi
+  local from_default="${CFG[SMTP_FROM]:-}"
+  [[ -n "$from_default" ]] || { is_email "${CFG[SMTP_USER]:-}" && from_default="${CFG[SMTP_USER]}"; }
+  CFG[SMTP_FROM]="$from_default"
+  alert_ask SMTP_FROM "Sender address shown on the alerts" is_email "That is not an e-mail address."
+}
+
+is_domain_or_ip() { is_ipv4 "$1" || is_domain "$1" || [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]]; }
+
+wizard_alerts() {
+  local choice
+  say ""
+  say "${C_BOLD}Alerts${C_RESET}"
+  say "  ${C_DIM}Two things send them: this server's watchdog (the app or the server is down) and the app itself (Home Assistant is${C_RESET}"
+  say "  ${C_DIM}unreachable). Both use the channels below. Several can be on at once; each is tried on its own.${C_RESET}"
+  CFG[ALERT_NAME]="${CFG[ALERT_NAME]:-$(hostname 2>/dev/null || echo server)}"
+  while true; do
+    say ""
+    say "  Now on: ${C_BOLD}$(alerts_configured_text)${C_RESET}"
+    say "    1) E-mail (SMTP)"
+    say "    2) Webhook (Slack, Discord, Mattermost, anything that takes JSON)"
+    say "    3) ntfy (free phone push, ntfy.sh or your own server)"
+    say "    4) Telegram bot"
+    say "    5) Heartbeat URL (healthchecks.io, Uptime Kuma: alerts you if this whole server goes silent)"
+    say "    6) Done"
+    choice="$(ask "Choose [1-6]" "6")"
+    case "$choice" in
+      1) wizard_alert_email ;;
+      2) alert_ask ALERT_WEBHOOK_URL "Webhook URL" is_safe_url "Please enter a plain http(s) URL without spaces or quotes." ;;
+      3)
+        alert_ask ALERT_NTFY_URL "ntfy topic URL (for example https://ntfy.sh/my-secret-topic-name)" is_safe_url "Please enter a plain http(s) URL."
+        [[ -z "${CFG[ALERT_NTFY_URL]}" ]] || alert_ask ALERT_NTFY_TOKEN "ntfy access token (Enter if the topic needs none)" is_any_text "x" secret
+        ;;
+      4)
+        say "  ${C_DIM}Create a bot with @BotFather (you get the token), send it a message, then open https://api.telegram.org/bot<TOKEN>/getUpdates to read your chat id.${C_RESET}"
+        alert_ask ALERT_TELEGRAM_BOT_TOKEN "Telegram bot token" is_telegram_token "That does not look like a bot token (123456:ABC-DEF...)." secret
+        [[ -z "${CFG[ALERT_TELEGRAM_BOT_TOKEN]}" ]] || alert_ask ALERT_TELEGRAM_CHAT_ID "Telegram chat id (a number, or @channelname)" is_telegram_chat "Please enter the numeric chat id (or @channelname)."
+        [[ -n "${CFG[ALERT_TELEGRAM_BOT_TOKEN]}" ]] || CFG[ALERT_TELEGRAM_CHAT_ID]=""
+        ;;
+      5) alert_ask HEARTBEAT_URL "Heartbeat URL (called every minute while everything is healthy)" is_safe_url "Please enter a plain http(s) URL." ;;
+      6|"") break ;;
+      *) warn "Please type a number from 1 to 6." ;;
+    esac
+  done
+}
+
 wizard_advanced() {
   local v hintip
   say ""
@@ -3596,18 +3735,8 @@ wizard_advanced() {
   done
   CFG[AUDIT_LOG_RETENTION_DAYS]="$v"
 
-  while true; do
-    v="$(ask "Alert webhook for down/recovered notices (Slack, Discord, Mattermost or generic; Enter to skip)" "${CFG[ALERT_WEBHOOK_URL]:-}")"
-    if [[ -z "$v" ]] || is_safe_url "$v"; then break; fi
-    warn "Please enter a plain http(s) URL without spaces or quotes."
-  done
-  CFG[ALERT_WEBHOOK_URL]="$v"
-  if [[ -n "$v" ]] && confirm "Send a test alert now?" y; then
-    if send_webhook "$v" "[HA Gatekeeper @ $(hostname)] Test alert from the installer. Alerts are working."; then
-      ok "Test alert sent. Check your channel."
-    else
-      warn "The webhook did not accept the test message. Check the URL."
-    fi
+  if confirm "Set up alerts (a message when Home Assistant or this server goes down)?" n; then
+    wizard_alerts
   fi
 
   if [[ "${CFG[GATEKEEPER_MODE]}" != local ]]; then
@@ -3652,7 +3781,7 @@ show_settings() {
     say "  Admin password     : set"
   fi
   say "  Audit log kept for : ${CFG[AUDIT_LOG_RETENTION_DAYS]} days"
-  say "  Alerts             : ${CFG[ALERT_WEBHOOK_URL]:+webhook configured}${CFG[ALERT_WEBHOOK_URL]:-none}"
+  say "  Alerts             : $(alerts_configured_text)"
   if [[ "${CFG[GATEKEEPER_MODE]}" != local ]]; then
     say "  Admin API limited to: ${CFG[ADMIN_ALLOWED_IPS]:-anyone with the password}"
   fi
@@ -3887,7 +4016,11 @@ print_summary() { # print_summary [failed]
   say "  - Docker restarts it after a crash and after a reboot."
   say "  - A watchdog checks it every minute and heals hangs, stopped/deleted containers and a dead Docker daemon."
   say "  - The database and .env are backed up daily to $APP_DIR/backups (kept: $BACKUP_KEEP)."
-  [[ -z "${CFG[ALERT_WEBHOOK_URL]:-}" ]] && say "  - Want a message when it goes down? Re-run with --reconfigure and set an alert webhook."
+  if [[ "$(alerts_configured_text)" == none ]]; then
+    say "  - Want a message when Home Assistant or the server goes down? Run: ${C_BOLD}sudo gatekeeper alerts${C_RESET} (e-mail, webhook, ntfy, Telegram)."
+  else
+    say "  - Alerts go to: $(alerts_configured_text). Check them any time: ${C_BOLD}gatekeeper alerts test${C_RESET}"
+  fi
   say ""
   say "  Manage it:   ${C_BOLD}gatekeeper status | verify | logs -f | update | backup | restart${C_RESET}"
   say "  Install log: $LOG_FILE"
@@ -4354,6 +4487,66 @@ cmd_2fa_reset() {
   ok "Two-factor login is off. Sign in with the password, then turn it on again under Security."
 }
 
+# Where "something is down" messages go. `gatekeeper alerts` (set up), `alerts test`, `alerts status`.
+alerts_status() {
+  say "Channels configured in $APP_DIR/.env: $(alerts_configured_text)"
+  if have docker && docker_up && [[ "$(docker inspect -f '{{.State.Running}}' "$GK_CONTAINER" 2>/dev/null || true)" == true ]]; then
+    say ""
+    say "As the app sees them (secrets are never shown):"
+    dc exec -T gatekeeper node dist/alertsCli.js status 2>&1 | sed 's/^/  /'
+  fi
+}
+
+alerts_test() {
+  local rc=0
+  say "${C_BOLD}1. From this server's watchdog${C_RESET} (it tells you when the app or the server is down):"
+  "$APP_DIR/deploy/watchdog.sh" --test-alert 2>&1 | sed 's/^/  /' || rc=1
+  [[ "${PIPESTATUS[0]}" == 0 ]] || rc=1
+  say ""
+  say "${C_BOLD}2. From the app${C_RESET} (it tells you when Home Assistant is unreachable):"
+  if have docker && docker_up && [[ "$(docker inspect -f '{{.State.Running}}' "$GK_CONTAINER" 2>/dev/null || true)" == true ]]; then
+    dc exec -T gatekeeper node dist/alertsCli.js test 2>&1 | sed 's/^/  /'
+    [[ "${PIPESTATUS[0]}" == 0 ]] || rc=1
+  else
+    say "  The $GK_CONTAINER container is not running, so this part was skipped."
+    rc=1
+  fi
+  say ""
+  if (( rc == 0 )); then ok "Every channel delivered. Check your inbox / phone."; else warn "At least one channel failed (see above). Fix it with: sudo gatekeeper alerts"; fi
+  return "$rc"
+}
+
+cmd_alerts() {
+  load_runtime_config
+  local sub="${COMMAND_ARGS[0]:-}" problems
+  case "$sub" in
+    test) alerts_test; return ;;
+    status) alerts_status; return ;;
+    "") ;;
+    *) die "Unknown alerts argument '$sub'. Use: gatekeeper alerts [test|status]" ;;
+  esac
+  interactive || die "Run this in a terminal. Without one, put the ALERT_*, SMTP_* and HEARTBEAT_URL values in $APP_DIR/.env and run: sudo gatekeeper restart"
+  wizard_alerts
+  problems="$(config_problems)"
+  if [[ -n "$problems" ]]; then
+    err "Not saved: $(tr '\n' ';' <<<"$problems")"
+    return 1
+  fi
+  write_env_file
+  sync_secret_files || die "Could not write the secret files."
+  ok "Alert settings saved to $APP_DIR/.env"
+  require_docker
+  if $SECRETS_CHANGED; then
+    run_logged "Restarting the app so it sees the new settings" dc up -d --force-recreate --remove-orphans gatekeeper || die "Could not restart the app."
+  else
+    run_logged "Applying the settings" dc up -d --remove-orphans || die "Could not apply the settings."
+  fi
+  wait_for_container "$GK_CONTAINER" 90 || warn "The app is not healthy yet; check: gatekeeper logs"
+  if [[ "$(alerts_configured_text)" != none ]] && confirm "Send a test alert through every channel now?" y; then
+    alerts_test || true
+  fi
+}
+
 cmd_logs() {
   load_runtime_config
   require_docker
@@ -4672,6 +4865,9 @@ Commands
   backup             Back up the database and .env into ./backups.
   restore FILE       Restore a backup made by 'backup'.
   uninstall          Remove services and containers (asks before touching data).
+  alerts [test|status]
+                     Set up where "Home Assistant / the server is down" messages go (e-mail, webhook, ntfy,
+                     Telegram, heartbeat); 'alerts test' sends a test through every channel.
   2fa-reset          Switch the administrator's two-factor login off (phone AND recovery codes lost).
   help
 
@@ -4726,7 +4922,7 @@ parse_args() {
       --quiet) QUIET=true ;;
       -v|--verbose) VERBOSE=true ;;
       --no-color) NO_COLOR_FLAG=true ;;
-      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|help)
+      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|alerts|help)
         if $have_command; then
           COMMAND_ARGS+=("$arg")
         else
@@ -4884,7 +5080,7 @@ main() {
   fi
 
   case "$COMMAND" in
-    install|update|backup|restore|start|stop|restart|uninstall|secrets) take_lock ;;
+    install|update|backup|restore|start|stop|restart|uninstall|secrets|alerts) take_lock ;;
   esac
 
   case "$COMMAND" in
@@ -4901,6 +5097,7 @@ main() {
     uninstall) cmd_uninstall ;;
     secrets)   cmd_secrets ;;
     2fa-reset) cmd_2fa_reset ;;
+    alerts)    cmd_alerts ;;
     *)         usage; exit 1 ;;
   esac
 }

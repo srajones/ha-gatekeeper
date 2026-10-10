@@ -143,6 +143,7 @@ gatekeeper logs [-f] [gatekeeper|caddy|watchdog]
 gatekeeper update            pull, back up, rebuild, restart, check; rolls back automatically on failure
 gatekeeper backup | restore FILE
 gatekeeper start | stop | restart     (stop also pauses the watchdog, also across reboots)
+gatekeeper alerts [test|status]  set up / test e-mail, webhook, ntfy, Telegram alerts (see ALERTS.md)
 gatekeeper 2fa-reset         switch the dashboard's two-factor login off (phone and recovery codes lost; see TWO_FACTOR.md)
 gatekeeper uninstall         removes services/containers; asks before touching data
                              (unattended: --yes keeps your data; add --purge to also delete data, .env, images, certificates)
