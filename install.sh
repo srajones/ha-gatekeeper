@@ -503,7 +503,9 @@ journal_rollback() { # journal_rollback [quiet]
   (( ${#J_DESC[@]} > 0 )) || return 0
   ROLLING_BACK=true
   trap - ERR
-  trap '' INT TERM HUP
+  # A dropped SSH session must not interrupt the undo: ignore the hang-up, and a closed terminal
+  # (broken pipe on output) must not kill it either; everything is also written to the log.
+  trap '' INT TERM HUP PIPE
   set +e
   local quiet="${1:-}" i rc fn desc parts=() failed=0 kept=0 done_n=0 sink paused=false
   sink="${LOG_FILE:-/dev/null}"
@@ -4739,6 +4741,8 @@ main() {
   if [[ "$COMMAND" == help ]]; then usage; exit 0; fi
 
   ensure_root
+  # Never let a package prompt (needrestart, debconf, config-file questions) stop an unattended run.
+  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
   detect_os
   init_logging
   if ! have_tty && ! $NON_INTERACTIVE; then
