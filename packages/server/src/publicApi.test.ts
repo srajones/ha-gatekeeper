@@ -256,3 +256,37 @@ test("serves the Swagger UI page", async () => {
   assert.equal(response.statusCode, 200);
   assert.match(String(response.headers["content-type"]), /^text\/html/);
 });
+
+test("many simultaneous state reads cost Home Assistant one request, and a service call refreshes the state", async () => {
+  const headers = { authorization: `Bearer ${active.apiKey}` };
+  const stateReads = () => haCalls.filter((call) => call === "GET /api/states/sensor.temperature").length;
+
+  // Another test may have filled the cache already; a service call empties it.
+  await app.inject({
+    method: "POST",
+    url: "/api/services/light/turn_on",
+    headers,
+    payload: { entity_id: "light.living_room" }
+  });
+
+  const before = stateReads();
+  const responses = await Promise.all(
+    Array.from({ length: 30 }, () => app.inject({ method: "GET", url: "/api/states/sensor.temperature", headers }))
+  );
+  assert.ok(responses.every((response) => response.statusCode === 200));
+  assert.equal(stateReads() - before, 1);
+
+  // Within the cache window the next read is served without asking Home Assistant again.
+  await app.inject({ method: "GET", url: "/api/states/sensor.temperature", headers });
+  assert.equal(stateReads() - before, 1);
+
+  // After a service call the next read goes to Home Assistant again (read-your-writes).
+  await app.inject({
+    method: "POST",
+    url: "/api/services/light/turn_on",
+    headers,
+    payload: { entity_id: "light.living_room" }
+  });
+  await app.inject({ method: "GET", url: "/api/states/sensor.temperature", headers });
+  assert.equal(stateReads() - before, 2);
+});

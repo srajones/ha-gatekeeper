@@ -34,8 +34,18 @@ test("standalone mode resolves HA config, admin secrets, CORS origin, and port",
     ADDON_EXPOSE_API: false,
     LOG_LEVEL: "debug",
     AUDIT_LOG_RETENTION_DAYS: 90,
-    TRUST_PROXY: false
+    TRUST_PROXY: false,
+    HA_STATE_CACHE_MS: 2000,
+    HA_MAX_CONCURRENCY: 8
   });
+});
+
+test("HA_STATE_CACHE_MS and HA_MAX_CONCURRENCY are configurable and validated", () => {
+  const env = resolveRuntimeConfig({ ...validStandaloneEnv, HA_STATE_CACHE_MS: "0", HA_MAX_CONCURRENCY: "3" });
+  assert.equal(env.HA_STATE_CACHE_MS, 0);
+  assert.equal(env.HA_MAX_CONCURRENCY, 3);
+  assert.throws(() => resolveRuntimeConfig({ ...validStandaloneEnv, HA_MAX_CONCURRENCY: "0" }), /HA_MAX_CONCURRENCY/);
+  assert.throws(() => resolveRuntimeConfig({ ...validStandaloneEnv, HA_STATE_CACHE_MS: "-1" }), /HA_STATE_CACHE_MS/);
 });
 
 test("AUDIT_LOG_RETENTION_DAYS defaults to 90 and accepts an explicit override", () => {

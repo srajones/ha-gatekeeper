@@ -65,6 +65,8 @@ export type RuntimeConfig = {
   LOG_LEVEL: z.infer<typeof logLevelSchema>;
   AUDIT_LOG_RETENTION_DAYS: number;
   TRUST_PROXY: TrustProxySetting;
+  HA_STATE_CACHE_MS: number;
+  HA_MAX_CONCURRENCY: number;
 };
 
 const commonSchema = z.object({
@@ -75,7 +77,11 @@ const commonSchema = z.object({
   API_KEY_HASH_SECRET: z.string().trim().min(16),
   CORS_ORIGIN: z.string().default("http://localhost:5173"),
   LOG_LEVEL: logLevelSchema,
-  AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().min(0).default(90)
+  AUDIT_LOG_RETENTION_DAYS: z.coerce.number().int().min(0).default(90),
+  // How long a state read is shared between callers (0 = off) and how many requests may be
+  // in flight to Home Assistant at once. See haGateway.ts.
+  HA_STATE_CACHE_MS: z.coerce.number().int().min(0).max(60_000).default(2000),
+  HA_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(8)
 });
 
 const standaloneSchema = commonSchema.extend({
@@ -114,7 +120,9 @@ export function resolveRuntimeConfig(raw: Record<string, string | undefined>): R
       // Never honored in add-on mode: ingress trust is decided from the real socket peer
       // (see adminAuth.ts), so letting X-Forwarded-For rewrite `request.ip` would let a LAN
       // client impersonate the Supervisor proxy.
-      TRUST_PROXY: false
+      TRUST_PROXY: false,
+      HA_STATE_CACHE_MS: parsed.HA_STATE_CACHE_MS,
+      HA_MAX_CONCURRENCY: parsed.HA_MAX_CONCURRENCY
     };
   }
 
@@ -134,7 +142,9 @@ export function resolveRuntimeConfig(raw: Record<string, string | undefined>): R
     ADDON_EXPOSE_API,
     LOG_LEVEL: parsed.LOG_LEVEL,
     AUDIT_LOG_RETENTION_DAYS: parsed.AUDIT_LOG_RETENTION_DAYS,
-    TRUST_PROXY: parsed.TRUST_PROXY
+    TRUST_PROXY: parsed.TRUST_PROXY,
+    HA_STATE_CACHE_MS: parsed.HA_STATE_CACHE_MS,
+    HA_MAX_CONCURRENCY: parsed.HA_MAX_CONCURRENCY
   };
 }
 

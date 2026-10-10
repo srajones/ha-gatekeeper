@@ -5,6 +5,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import { prisma } from "./db.js";
 import { env } from "./env.js";
 import { proxyHaServiceCall, proxyHaState } from "./ha.js";
+import { HaBusyError } from "./haGateway.js";
 import { asServiceRequestBody, extractRequestedEntityIds } from "./policy.js";
 import { findAllowedServicePermission, findAllowedStatePermission } from "./permissions.js";
 import { getApiKeyPrefix, hashApiKey, timingSafeEqual } from "./security.js";
@@ -205,7 +206,8 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
           400: { $ref: "publicApiError#" },
           401: { $ref: "publicApiError#" },
           403: { $ref: "publicApiError#" },
-          502: { $ref: "publicApiError#" }
+          502: { $ref: "publicApiError#" },
+          503: { $ref: "publicApiError#" }
         }
       }
     },
@@ -306,6 +308,9 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
           error: message
         });
 
+        if (err instanceof HaBusyError) {
+          return reply.header("retry-after", "1").status(503).send({ ok: false, error: "ha_busy" });
+        }
         request.log.error({ err }, "ha_proxy_failed");
         return reply.status(502).send({ ok: false, error: "ha_proxy_failed" });
       }
@@ -330,7 +335,8 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         response: {
           401: { $ref: "publicApiError#" },
           403: { $ref: "publicApiError#" },
-          502: { $ref: "publicApiError#" }
+          502: { $ref: "publicApiError#" },
+          503: { $ref: "publicApiError#" }
         }
       }
     },
@@ -397,6 +403,9 @@ export const publicApiRoutes: FastifyPluginAsync = async (app) => {
         error: message
       });
 
+      if (err instanceof HaBusyError) {
+        return reply.header("retry-after", "1").status(503).send({ ok: false, error: "ha_busy" });
+      }
       request.log.error({ err }, "ha_state_proxy_failed");
       return reply.status(502).send({ ok: false, error: "ha_state_proxy_failed" });
     }
