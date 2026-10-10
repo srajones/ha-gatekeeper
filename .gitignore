@@ -27,3 +27,4 @@ docs/superpowers/
 !/deploy/certs/.gitkeep
 /gatekeeper-root-ca.crt
 /secrets/
+/deploy/caddy/.Caddyfile.*

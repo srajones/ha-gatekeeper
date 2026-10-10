@@ -4005,31 +4005,36 @@ commit_install() {
 }
 
 print_changes_summary() {
-  local line n=0
+  local line n=0 inside=() outside=()
   banner "What this installation changed on your server"
-  say "  Outside $APP_DIR:"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    say "   * $line"
-    n=$((n + 1))
+    if [[ "$line" == *"$APP_DIR"* ]]; then inside+=("$line"); else outside+=("$line"); fi
   done < <(journal_list)
-  (( n > 0 )) || say "   * nothing: everything needed was already in place"
-  say "  Inside $APP_DIR: .env, secrets/, data/, backups/, the generated configuration, and the Docker image and containers."
+  say "  ${C_BOLD}Outside $APP_DIR:${C_RESET}"
+  if (( ${#outside[@]} > 0 )); then
+    for line in "${outside[@]}"; do say "   * $line"; done
+  else
+    say "   * nothing: everything needed was already in place"
+  fi
+  say "  ${C_BOLD}Inside $APP_DIR:${C_RESET}"
+  if (( ${#inside[@]} > 0 )); then
+    for line in "${inside[@]}"; do say "   * $line"; done
+  else
+    say "   * (nothing new: the existing files were re-used)"
+  fi
   say ""
   say "  ${C_BOLD}Undo it:${C_RESET}  sudo gatekeeper uninstall"
   say "  uninstall removes: the containers, the systemd units (or cron file), the 'gatekeeper' command, the firewall rules"
   say "  named 'HA Gatekeeper ...', and the secrets/ folder. With your OK (or --purge) it also deletes the built image,"
   say "  the saved HTTPS certificates, the data and .env."
   say "  uninstall does ${C_BOLD}NOT${C_RESET} undo these (they may be useful to other things on the server):"
-  local kept=false
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     say "   * $line"
-    kept=true
   done < <(journal_list keep-only)
   say "   * base Docker images that were downloaded, and Docker's build cache (docker image prune / docker builder prune)"
   say "   * the code in $APP_DIR, the backups in $APP_DIR/backups and the log $REAL_LOG_FILE"
-  $kept || true
 }
 
 cmd_install() {
