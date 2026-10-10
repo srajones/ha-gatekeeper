@@ -5,7 +5,13 @@
 # To run it manually instead:
 #
 #   cp deploy/env.example .env        # then fill in the REQUIRED values
+#   sudo ./install.sh secrets         # writes ./secrets/* from .env (the container reads secrets as files)
 #   docker compose up -d --build
+#
+# Secrets (HA token, admin password, session and token-hash secrets) are NOT passed as container
+# environment variables, because those are readable with `docker inspect` and in /proc. They are
+# files in ./secrets (root-only directory), mounted read-only; the app reads them through the
+# *_FILE variables below.
 #
 # Services
 #   gatekeeper  API + admin UI. Always on. Published on 127.0.0.1 only, because Docker
@@ -38,10 +44,10 @@ services:
       PORT: "8080"
       DATABASE_URL: "file:/data/ha-gatekeeper.db"
       HA_BASE_URL: "${HA_BASE_URL:?HA_BASE_URL is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
-      HA_TOKEN: "${HA_TOKEN:?HA_TOKEN is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?ADMIN_PASSWORD is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
-      ADMIN_SESSION_SECRET: "${ADMIN_SESSION_SECRET:?ADMIN_SESSION_SECRET is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
-      API_KEY_HASH_SECRET: "${API_KEY_HASH_SECRET:?API_KEY_HASH_SECRET is not set - run ./install.sh, or copy deploy/env.example to .env and fill it in}"
+      HA_TOKEN_FILE: /run/secrets/ha_token
+      ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      ADMIN_SESSION_SECRET_FILE: /run/secrets/admin_session_secret
+      API_KEY_HASH_SECRET_FILE: /run/secrets/api_key_hash_secret
       CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:8080}"
       AUDIT_LOG_RETENTION_DAYS: "${AUDIT_LOG_RETENTION_DAYS:-90}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
@@ -56,6 +62,12 @@ services:
       # SQLite database. Must be writable by uid 1001 (install.sh takes care of this).
       - "${GATEKEEPER_DATA_DIR:-./data}:/data:z"
       - "./deploy/certs:/certs:ro,z"
+      # One file per secret, read-only. install.sh creates them (mode 0400, uid 1001) inside the
+      # root-only ./secrets directory before every start.
+      - "./secrets/ha_token:/run/secrets/ha_token:ro,z"
+      - "./secrets/admin_password:/run/secrets/admin_password:ro,z"
+      - "./secrets/admin_session_secret:/run/secrets/admin_session_secret:ro,z"
+      - "./secrets/api_key_hash_secret:/run/secrets/api_key_hash_secret:ro,z"
     security_opt:
       - no-new-privileges:true
     cap_drop:

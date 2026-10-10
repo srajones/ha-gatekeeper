@@ -56,6 +56,9 @@ LOG_FILE="${GK_LOG_FILE:-/var/log/ha-gatekeeper-install.log}"
 SYSTEMD_DIR="${GK_SYSTEMD_DIR:-/etc/systemd/system}"
 CRON_FILE="${GK_CRON_FILE:-/etc/cron.d/ha-gatekeeper}"
 BIN_LINK="${GK_BIN_LINK:-/usr/local/bin/gatekeeper}"
+SWAP_FILE="${GK_SWAP_FILE:-/swapfile}"
+FSTAB_FILE="${GK_FSTAB_FILE:-/etc/fstab}"
+WATCHDOG_LOG="${GK_WATCHDOG_LOG:-/var/log/ha-gatekeeper-watchdog.log}"
 
 SELF_PATH=""
 SELF_DIR=""
@@ -84,8 +87,14 @@ CONFIG_FILE=""
 WITH_ENV=false
 ASSUME_YES=false
 PURGE=false
+DRY_RUN=false
+KEEP_ON_FAILURE=false
+[[ "${GATEKEEPER_KEEP_ON_FAILURE:-}" == 1 ]] && KEEP_ON_FAILURE=true
 
 TMP_FILES=()
+PENDING_LOG=""        # install runs log to a temp file until the plan is approved
+REAL_LOG_FILE=""
+DISCARD_LOG=false
 WATCHDOG_PAUSED_BY_US=false
 GENERATED_ADMIN_PASSWORD=""
 
@@ -159,14 +168,29 @@ mktemp_tracked() { # mktemp_tracked [dir] -> path (removed on exit)
   printf '%s' "$f"
 }
 
+# EXIT trap. A failed install (error, Ctrl-C, failed final check) is rolled back here, before the
+# temp files that the undo steps need are removed.
 cleanup() {
-  local f
+  local rc=$? f
+  trap - EXIT
+  if $INSTALL_ACTIVE && ! $ROLLING_BACK && (( rc != 0 )); then
+    if $KEEP_ON_FAILURE; then
+      warn "Leaving the failed installation in place because --keep-on-failure is set."
+    else
+      journal_rollback || true
+    fi
+  fi
   for f in "${TMP_FILES[@]:-}"; do
     [[ -n "$f" ]] && rm -rf "$f" 2>/dev/null || true
   done
   if $WATCHDOG_PAUSED_BY_US; then
     resume_watchdog
   fi
+  if [[ -n "$PENDING_LOG" ]]; then
+    # An install that never reached the approval: keep its log only if it failed.
+    if (( rc != 0 )) && ! $DISCARD_LOG; then adopt_real_log; else rm -f -- "$PENDING_LOG"; fi
+  fi
+  exit "$rc"
 }
 
 MAIN_PID=$$
@@ -177,8 +201,12 @@ on_error() {
   [[ "$BASHPID" == "$MAIN_PID" ]] || return 0
   trap - ERR
   err "Stopped unexpectedly (exit code $rc, line $line)."
-  hint "Nothing is half-installed in a way that blocks a retry: it is safe to run this script again."
-  hint "Details: $LOG_FILE"
+  if $INSTALL_ACTIVE && ! $KEEP_ON_FAILURE; then
+    hint "This run's changes are being undone now, so it is safe to run the installer again."
+  else
+    hint "It is safe to run this script again."
+  fi
+  hint "Details: ${REAL_LOG_FILE:-$LOG_FILE}"
   exit "$rc"
 }
 
@@ -224,6 +252,364 @@ run_logged() {
     tail -n 25 "$out" | sed 's/^/       | /'
   fi
   return "$rc"
+}
+
+# -------------------------------------------------------------------------------------------------
+# Change journal and automatic rollback
+#
+# Every change this installer makes outside its own checkout is recorded here *before* it is made,
+# together with the function that undoes it. If the install fails (an error, Ctrl-C, or the final
+# health check), the entries are undone in reverse order and each undo is printed. Anything that
+# was already on the server (Docker, packages, firewall rules, web servers, other containers) is
+# never recorded and therefore never touched.
+# -------------------------------------------------------------------------------------------------
+
+readonly JSEP=$'\x1f'
+J_DESC=(); J_FN=(); J_ARGS=(); J_KEEP=()
+J_KEEP_NEXT=0          # set to 1 (as a prefix of jpush) for changes that `uninstall` does not undo
+J_LAST=-1
+JOURNAL_LOG=""         # append-only text copy, written once the plan is approved
+JOURNAL_TMP=""         # scratch folder for the files we back up before replacing them
+INSTALL_ACTIVE=false   # true from the start of an install until it is committed
+ROLLING_BACK=false
+RV_NOTE=""
+
+journal_tmp() {
+  if [[ -z "$JOURNAL_TMP" ]]; then
+    JOURNAL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gk-journal.XXXXXX")"
+    chmod 700 "$JOURNAL_TMP"
+    TMP_FILES+=("$JOURNAL_TMP")
+  fi
+  printf '%s' "$JOURNAL_TMP"
+}
+
+# jpush "what was done (shown to the user)" undo_function [args...]
+jpush() {
+  $ROLLING_BACK && return 0
+  local desc="$1" fn="$2" args="" a
+  shift 2
+  for a in "$@"; do
+    [[ "$a" != *"$JSEP"* && "$a" != *$'\n'* ]] || die "internal error: a journal argument contains a separator"
+    args+="$a$JSEP"
+  done
+  J_DESC+=("$desc"); J_FN+=("$fn"); J_ARGS+=("$args"); J_KEEP+=("$J_KEEP_NEXT")
+  J_LAST=$(( ${#J_DESC[@]} - 1 ))
+  if [[ -n "$JOURNAL_LOG" ]]; then
+    printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$fn" "$desc" >>"$JOURNAL_LOG" 2>/dev/null || true
+  fi
+  log_file "JOURNAL $desc  [undo: $fn $*]"
+}
+
+# jdrop INDEX: forget an entry whose change has already been undone on the normal path.
+jdrop() { J_DESC[$1]=""; J_FN[$1]=rv_noop; J_ARGS[$1]=""; J_KEEP[$1]=0; }
+
+# Private copy of a file we are about to replace (restored if the install is rolled back).
+jbackup() {
+  local src="$1" dst
+  dst="$(journal_tmp)/bak.${#J_DESC[@]}.$(basename "$src")"
+  cp -a -- "$src" "$dst"
+  printf '%s' "$dst"
+}
+
+# Paths the rollback may delete recursively: never a system directory, never anything short.
+safe_rm_target() {
+  local p="$1"
+  [[ "$p" == /* && "$p" != *..* ]] || return 1
+  case "$p" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var|/var/lib|/var/log) return 1 ;;
+  esac
+  (( $(awk -F/ '{print NF - 1}' <<<"$p") >= 2 ))
+}
+
+# --- undo functions. Return 0 = undone, 1 = failed, 2 = deliberately left (RV_NOTE says why).
+
+rv_noop() { return 0; }
+rv_note() { RV_NOTE="$1"; return 2; }
+
+rv_rm() {
+  local p="$1"
+  [[ "$p" == /* ]] || return 1
+  if [[ -d "$p" && ! -L "$p" ]]; then RV_NOTE="$p is a folder, left alone"; return 2; fi
+  rm -f -- "$p"
+}
+
+rv_restore() { # rv_restore PATH BACKUP
+  local p="$1" bak="$2"
+  [[ -e "$bak" || -L "$bak" ]] || { RV_NOTE="the saved copy of $p is missing"; return 1; }
+  rm -f -- "$p"
+  cp -a -- "$bak" "$p"
+}
+
+rv_rmdir() {
+  local p="$1"
+  [[ -d "$p" ]] || return 0
+  if rmdir -- "$p" 2>/dev/null; then return 0; fi
+  RV_NOTE="$p is not empty, left in place"
+  return 2
+}
+
+rv_rmtree() {
+  local p="$1"
+  [[ -e "$p" || -L "$p" ]] || return 0
+  safe_rm_target "$p" || { RV_NOTE="refusing to delete $p"; return 1; }
+  rm -rf -- "$p"
+}
+
+rv_daemon_reload() { have_systemd && systemctl daemon-reload; return 0; }
+
+rv_unit_disable() {
+  have_systemd || return 0
+  systemctl disable --now "$@" || true
+}
+
+rv_docker_boot_disable() {
+  have_systemd || return 0
+  systemctl disable docker.service docker.socket 2>/dev/null || true
+}
+
+rv_ufw_delete() { have ufw || return 0; ufw --force delete "$@"; }
+rv_ufw_disable() { have ufw || return 0; ufw --force disable; }
+
+rv_firewalld() { # rv_firewalld service|port|rich VALUE
+  have firewall-cmd || return 0
+  case "$1" in
+    service) firewall-cmd --permanent --remove-service="$2" ;;
+    port) firewall-cmd --permanent --remove-port="$2" ;;
+    rich) firewall-cmd --permanent --remove-rich-rule="$2" ;;
+  esac
+  firewall-cmd --reload
+}
+
+rv_swap() { # rv_swap FILE
+  swapoff "$1" 2>/dev/null || true
+  rm -f -- "$1"
+}
+
+rv_fstab_line() { # rv_fstab_line FSTAB LINE
+  local fstab="$1" line="$2" tmp
+  [[ -f "$fstab" ]] || return 0
+  tmp="$(mktemp)"
+  grep -vxF -- "$line" "$fstab" >"$tmp" || true
+  cat "$tmp" >"$fstab"
+  rm -f "$tmp"
+}
+
+# Names of installed packages (apt only; other package managers are not rolled back).
+pkg_snapshot() { # pkg_snapshot FILE
+  [[ "$PKG" == apt ]] || return 1
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 ~ /^ii/ {print $2}' | LC_ALL=C sort -u >"$1"
+}
+
+# Remove exactly the packages that appeared since SNAPSHOT, but only if apt agrees that nothing
+# else would go with them. Otherwise leave them and say so.
+rv_pkgs_since() {
+  local snap="$1" now cand sim extra
+  if [[ "$PKG" != apt ]]; then RV_NOTE="installed packages were left in place (automatic removal is only done with apt)"; return 2; fi
+  [[ -s "$snap" ]] || { RV_NOTE="no package snapshot to compare with"; return 2; }
+  now="$(mktemp)"
+  pkg_snapshot "$now"
+  cand="$(LC_ALL=C comm -13 "$snap" "$now" | tr '\n' ' ')"
+  rm -f "$now"
+  cand="${cand% }"
+  [[ -n "$cand" ]] || return 0
+  # shellcheck disable=SC2086
+  sim="$(apt-get -s remove --purge $cand 2>/dev/null | awk '$1 == "Remv" || $1 == "Purg" {print $2}' | LC_ALL=C sort -u)"
+  extra="$(LC_ALL=C comm -13 <(tr ' ' '\n' <<<"$cand" | LC_ALL=C sort -u) <<<"$sim" | tr '\n' ' ')"
+  if [[ -n "${extra// /}" ]]; then
+    RV_NOTE="removing $cand would also remove $extra; left installed (remove by hand if you want)"
+    return 2
+  fi
+  wait_for_apt_lock
+  # shellcheck disable=SC2086
+  DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y -qq -o DPkg::Lock::Timeout=120 $cand
+}
+
+# Docker Engine installed by this run: its packages, the repository definition the Docker
+# installer added, and (only if they did not exist before) its data folders.
+rv_docker_engine() { # rv_docker_engine PKG_SNAPSHOT FILES_BEFORE HAD_DOCKER_DIR HAD_CONTAINERD_DIR
+  local snap="$1" before="$2" had_d="$3" had_c="$4" f rc=0
+  rv_pkgs_since "$snap" || rc=$?
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    grep -qxF -- "$f" "$before" 2>/dev/null && continue
+    case "$(basename "$f")" in *docker*|*Docker*) rm -f -- "$f" ;; esac
+  done < <(find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/yum.repos.d -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort)
+  if (( rc == 0 )); then
+    [[ "$had_d" == 0 ]] && rm -rf /var/lib/docker
+    [[ "$had_c" == 0 ]] && rm -rf /var/lib/containerd
+  fi
+  return "$rc"
+}
+
+rv_docker_logout() { have docker && docker logout >/dev/null 2>&1; return 0; }
+
+rv_image_rm() {
+  have docker && docker_ready || return 0
+  local img rc=0
+  for img in "$@"; do
+    docker image inspect "$img" >/dev/null 2>&1 || continue
+    docker rmi "$img" >/dev/null 2>&1 || rc=1
+  done
+  (( rc == 0 )) || RV_NOTE="some images are still in use"
+  return "$rc"
+}
+
+rv_volume_rm() {
+  have docker && docker_ready || return 0
+  local v
+  for v in "$@"; do docker volume rm "$v" >/dev/null 2>&1 || true; done
+}
+
+# Containers started by this run. When a stack was already installed, the old settings are put
+# back by rv_restore_env instead, so the old containers are not removed here.
+rv_stack_down() { # rv_stack_down PREEXISTING(0|1)
+  [[ "$1" == 1 ]] && return 0
+  have docker && docker_ready || return 0
+  if [[ -f "$APP_DIR/.env" ]]; then
+    ( cd "$APP_DIR" && docker compose --profile proxy down --remove-orphans ) || return 1
+  else
+    docker rm -f "$GK_CONTAINER" "$CADDY_CONTAINER" 2>/dev/null || true
+  fi
+}
+
+# .env replaced by this run: put the previous one back, rewrite the secret files from it and, if
+# the stack was already installed, start it again with the old settings.
+rv_restore_env() { # rv_restore_env BACKUP STACK_PREEXISTING(0|1)
+  local bak="$1" pre="$2"
+  [[ -f "$bak" ]] || { RV_NOTE="the saved copy of .env is missing"; return 1; }
+  cp -p -- "$bak" "$APP_DIR/.env"
+  chmod 600 "$APP_DIR/.env"
+  if [[ "$pre" == 1 ]] && have docker && docker_ready; then
+    cfg_defaults
+    cfg_load_file "$APP_DIR/.env"
+    derive_config
+    sync_secret_files
+    dc up -d --no-build --remove-orphans --force-recreate || { RV_NOTE="the old settings are back but the stack did not start"; return 1; }
+    wait_for_container "$GK_CONTAINER" 90 || { RV_NOTE="the old settings are back but the container is not healthy yet"; return 1; }
+  fi
+}
+
+# Undo everything recorded so far, newest first. Never aborts half-way.
+journal_rollback() { # journal_rollback [quiet]
+  $ROLLING_BACK && return 0
+  (( ${#J_DESC[@]} > 0 )) || return 0
+  ROLLING_BACK=true
+  trap - ERR
+  trap '' INT TERM HUP
+  set +e
+  local quiet="${1:-}" i rc fn desc parts=() failed=0 kept=0 done_n=0 sink paused=false
+  sink="${LOG_FILE:-/dev/null}"
+  if [[ "$quiet" != quiet ]]; then
+    printf '\n%s%sUndoing what this installation changed (newest first)%s\n' "$C_BOLD" "$C_YELLOW" "$C_RESET"
+    printf '%sAnything that was already on this server is left alone.%s\n' "$C_DIM" "$C_RESET"
+  fi
+  log_file "ROLLBACK started with ${#J_DESC[@]} entries"
+  if [[ "$quiet" != quiet && -d "$STATE_DIR" && ! -e "$STATE_DIR/paused" ]]; then
+    pause_watchdog 900 >/dev/null 2>&1 && paused=true
+  fi
+
+  for (( i = ${#J_DESC[@]} - 1; i >= 0; i-- )); do
+    desc="${J_DESC[i]}"
+    [[ -n "$desc" ]] || continue
+    fn="${J_FN[i]}"
+    RV_NOTE=""
+    parts=()
+    IFS="$JSEP" read -r -a parts <<<"${J_ARGS[i]}"
+    "$fn" "${parts[@]+"${parts[@]}"}" >>"$sink" 2>&1
+    rc=$?
+    case "$rc" in
+      0) done_n=$((done_n + 1)); [[ "$quiet" == quiet ]] || printf '  %s[undone]%s %s\n' "$C_GREEN" "$C_RESET" "$desc"; log_file "ROLLBACK undone: $desc" ;;
+      2) kept=$((kept + 1)); [[ "$quiet" == quiet ]] || printf '  %s[kept]%s   %s\n           %s%s%s\n' "$C_YELLOW" "$C_RESET" "$desc" "$C_DIM" "$RV_NOTE" "$C_RESET"; log_file "ROLLBACK kept: $desc ($RV_NOTE)" ;;
+      *) failed=$((failed + 1)); printf '  %s[FAILED]%s %s\n           %s%s%s\n' "$C_RED" "$C_RESET" "$desc" "$C_DIM" "${RV_NOTE:-see $sink}" "$C_RESET"; log_file "ROLLBACK FAILED: $desc ($RV_NOTE)" ;;
+    esac
+  done
+
+  J_DESC=(); J_FN=(); J_ARGS=(); J_KEEP=()
+  $paused && resume_watchdog
+  if [[ "$quiet" != quiet ]]; then
+    if (( failed == 0 && kept == 0 )); then
+      printf '\n%s%sEverything this run changed has been undone.%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
+    elif (( failed == 0 )); then
+      printf '\n%sUndone: %s. Left in place on purpose: %s (see above).%s\n' "$C_BOLD" "$done_n" "$kept" "$C_RESET"
+    else
+      printf '\n%s%s%s step(s) could not be undone automatically (listed above). Install log: %s%s\n' "$C_BOLD" "$C_RED" "$failed" "${REAL_LOG_FILE:-$LOG_FILE}" "$C_RESET"
+    fi
+  fi
+  return "$failed"
+}
+
+# Print the journal as a list of what changed (used for the end-of-run summary).
+journal_list() { # journal_list [keep-only]
+  local i
+  for i in "${!J_DESC[@]}"; do
+    [[ -n "${J_DESC[i]}" ]] || continue
+    [[ "${J_FN[i]}" == rv_noop ]] && continue
+    if [[ "${1:-}" == keep-only ]]; then [[ "${J_KEEP[i]}" == 1 ]] || continue; fi
+    printf '%s\n' "${J_DESC[i]}"
+  done
+}
+
+# --- journaled primitives used by the install steps
+
+# jx_mkdir DIR [tree]: create DIR (and missing parents); undo removes only what was created.
+# With "tree" the undo deletes DIR with everything in it (for folders only this installer fills).
+jx_mkdir() {
+  local dir="$1" mode="${2:-}" p="$1" new=() n
+  while [[ -n "$p" && "$p" != / && ! -e "$p" ]]; do
+    new=("$p" ${new[@]+"${new[@]}"})
+    p="$(dirname "$p")"
+  done
+  (( ${#new[@]} > 0 )) || return 0
+  for n in "${new[@]}"; do
+    if [[ "$n" == "$dir" && "$mode" == tree ]]; then
+      jpush "Created folder $n" rv_rmtree "$n"
+    else
+      jpush "Created folder $n" rv_rmdir "$n"
+    fi
+  done
+  mkdir -p "$dir"
+}
+
+# jx_install_file SRC DEST MODE: put SRC at DEST. A new file is removed on rollback, a replaced
+# one is restored; an identical file is left alone and not recorded.
+jx_install_file() {
+  local src="$1" dest="$2" mode="$3" bak
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    if [[ ! -L "$dest" ]] && cmp -s "$src" "$dest"; then
+      chmod "$mode" "$dest"
+      return 0
+    fi
+    bak="$(jbackup "$dest")"
+    jpush "Replaced $dest (the previous version is put back on rollback)" rv_restore "$dest" "$bak"
+  else
+    jpush "Created $dest" rv_rm "$dest"
+  fi
+  rm -f -- "$dest"
+  install -m "$mode" "$src" "$dest"
+}
+
+# jx_pkg_install NAME...: install packages; undo removes exactly the ones that were not there.
+jx_pkg_install() {
+  local snap now new idx rc=0
+  snap="$(journal_tmp)/pkgs.${#J_DESC[@]}"
+  if pkg_snapshot "$snap"; then
+    jpush "Installed packages: $*" rv_pkgs_since "$snap"
+    idx=$J_LAST
+    pkg_install "$@" || rc=$?
+    now="$(mktemp)"
+    pkg_snapshot "$now"
+    new="$(LC_ALL=C comm -13 "$snap" "$now" | tr '\n' ' ')"
+    rm -f "$now"
+    if [[ -z "${new// /}" ]]; then
+      jdrop "$idx"               # nothing new arrived (already installed, or the install failed cleanly)
+    else
+      J_DESC[idx]="Installed packages: ${new% }"
+      J_KEEP[idx]=1              # uninstall does not remove packages
+    fi
+    return "$rc"
+  fi
+  J_KEEP_NEXT=1 jpush "Installed packages: $*" rv_note "packages were left installed (automatic removal is only done with apt)"
+  pkg_install "$@"
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -333,9 +719,27 @@ APT_LOCK_WAITED=false
 
 # True while apt/dpkg really holds one of its locks. Never match on process names: the idle
 # unattended-upgrades daemon runs permanently on stock Ubuntu and is not a lock holder.
+APT_LOCK_PATHS=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock)
 apt_lock_held() {
-  have fuser || return 1
-  fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1
+  local f ino dev maj min
+  if have fuser; then
+    fuser "${APT_LOCK_PATHS[@]}" >/dev/null 2>&1
+    return
+  fi
+  # Fresh Debian images ship without fuser (psmisc): ask the kernel which files are locked,
+  # which is the same information fuser reads.
+  [[ -r /proc/locks ]] || return 1
+  for f in "${APT_LOCK_PATHS[@]}"; do
+    [[ -e "$f" ]] || continue
+    ino="$(stat -c %i "$f" 2>/dev/null)" || continue
+    dev="$(stat -c %d "$f" 2>/dev/null)" || continue
+    maj=$(( (dev >> 8) & 0xfff ))
+    min=$(( (dev & 0xff) | ((dev >> 12) & 0xfff00) ))
+    if grep -qF -- " $(printf '%02x:%02x:%s' "$maj" "$min" "$ino") " /proc/locks 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 wait_for_apt_lock() {
@@ -357,9 +761,19 @@ wait_for_apt_lock() {
 }
 
 # Let every apt/dpkg run started by the Docker installer wait for the lock instead of failing.
-APT_LOCK_CONF=/etc/apt/apt.conf.d/99gatekeeper-lock
-apt_lock_conf_on()  { [[ "$PKG" == apt ]] && printf 'DPkg::Lock::Timeout "300";\nAPT::Get::Assume-Yes "true";\n' >"$APT_LOCK_CONF" 2>/dev/null || true; }
-apt_lock_conf_off() { rm -f "$APT_LOCK_CONF" 2>/dev/null || true; }
+APT_LOCK_CONF="${GK_APT_CONF:-/etc/apt/apt.conf.d/99gatekeeper-lock}"
+APT_CONF_IDX=-1
+apt_lock_conf_on() {
+  [[ "$PKG" == apt && -d "$(dirname "$APT_LOCK_CONF")" ]] || return 0
+  jpush "Temporarily created $APT_LOCK_CONF while Docker installs" rv_rm "$APT_LOCK_CONF"
+  APT_CONF_IDX=$J_LAST
+  printf 'DPkg::Lock::Timeout "300";\nAPT::Get::Assume-Yes "true";\n' >"$APT_LOCK_CONF" 2>/dev/null || true
+}
+apt_lock_conf_off() {
+  rm -f "$APT_LOCK_CONF" 2>/dev/null || true
+  if (( APT_CONF_IDX >= 0 )); then jdrop "$APT_CONF_IDX"; APT_CONF_IDX=-1; fi
+  return 0
+}
 
 pkg_refresh() {
   $PKG_UPDATED && return 0
@@ -389,18 +803,45 @@ pkg_install() { # pkg_install name...   (names are identical across the supporte
   esac
 }
 
-ensure_prereqs() {
-  local need=()
-  have curl    || need+=(curl)
-  have openssl || need+=(openssl)
-  have git     || need+=(git)
-  have jq      || need+=(jq)
-  have flock   || need+=(util-linux)
-  have tar     || need+=(tar)
-  have gzip    || need+=(gzip)
+# Packages the installer still needs on this server (read-only: installs nothing).
+P_PKGS=()
+compute_missing_prereqs() {
+  P_PKGS=()
+  have curl    || P_PKGS+=(curl)
+  have openssl || P_PKGS+=(openssl)
+  have git     || P_PKGS+=(git)
+  have jq      || P_PKGS+=(jq)
+  have flock   || P_PKGS+=(util-linux)
+  have tar     || P_PKGS+=(tar)
+  have gzip    || P_PKGS+=(gzip)
   # fuser (psmisc) lets the installer tell a busy apt lock from a stale one; minimal images lack it.
-  if [[ "$PKG" == apt ]]; then have fuser || need+=(psmisc); fi
-  [[ -e /etc/ssl/certs/ca-certificates.crt || -d /etc/pki/tls/certs || -e /etc/ssl/cert.pem ]] || need+=(ca-certificates)
+  if [[ "$PKG" == apt ]]; then have fuser || P_PKGS+=(psmisc); fi
+  [[ -e /etc/ssl/certs/ca-certificates.crt || -d /etc/pki/tls/certs || -e /etc/ssl/cert.pem ]] || P_PKGS+=(ca-certificates)
+  return 0
+}
+
+# A package install that has to happen before the full plan can be shown (for example curl, to test
+# Home Assistant while asking the questions). Asks first; --yes answers it.
+consent_install_tools() { # consent_install_tools "why" PKG...
+  local why="$1"
+  shift
+  say ""
+  say "${C_BOLD}$why${C_RESET}"
+  say "  This needs the package(s): $*   (installed with ${PKG:-the package manager}; it is the only change made before you see the full plan)"
+  if $DRY_RUN; then
+    warn "Dry run: not installing $*; some checks are skipped."
+    return 1
+  fi
+  if ! $ASSUME_YES; then
+    interactive || die "Cannot ask for permission without a terminal. Install $* yourself, or re-run with --yes."
+    confirm "Install $* now?" n || die "Cancelled. Nothing was changed."
+  fi
+  jx_pkg_install "$@" || die "Could not install: $*. Install them manually and re-run."
+}
+
+ensure_prereqs() {
+  compute_missing_prereqs
+  local need=("${P_PKGS[@]+"${P_PKGS[@]}"}")
 
   if (( ${#need[@]} == 0 )); then
     ok "Required tools present (curl, openssl, git, jq, flock, tar)"
@@ -408,7 +849,7 @@ ensure_prereqs() {
   fi
 
   info "Installing required tools: ${need[*]}"
-  if ! pkg_install "${need[@]}"; then
+  if ! jx_pkg_install "${need[@]}"; then
     die "Could not install: ${need[*]}. Install them manually (for example: apt-get install ${need[*]}) and re-run."
   fi
 
@@ -422,42 +863,64 @@ mem_mb()  { awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo; }
 swap_mb() { awk '/^SwapTotal:/ {printf "%d", $2/1024}' /proc/meminfo; }
 disk_free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
 
-ensure_swap() {
-  local mem swap total size free path=/swapfile
+# Decides (without changing anything) whether a swap file is needed and wanted; sets P_SWAP_MB.
+P_SWAP_MB=0
+swap_plan() {
+  P_SWAP_MB=0
+  local mem swap total size free path="$SWAP_FILE"
   mem="$(mem_mb)"; swap="$(swap_mb)"; total=$((mem + swap))
   (( total >= 1800 )) && return 0
 
-  warn "Only ${mem} MB RAM and ${swap} MB swap. Building the image can run out of memory on a server this small."
   if [[ -e "$path" ]]; then
-    warn "$path already exists but is not active; leaving it alone."
+    warn "Only ${mem} MB RAM and ${swap} MB swap, and $path already exists but is not active; leaving it alone."
     return 0
   fi
-
   size=$((2048 - total))
   (( size < 1024 )) && size=1024
   (( size > 2048 )) && size=2048
   free="$(disk_free_mb /)"
   if (( free < size + 2048 )); then
-    warn "Not enough free disk (${free} MB) to add a ${size} MB swap file safely; skipping."
+    warn "Only ${mem} MB RAM, and not enough free disk (${free} MB) to add a ${size} MB swap file safely; skipping."
+    return 0
+  fi
+  if [[ "${GATEKEEPER_SWAP:-}" == 0 ]]; then
+    warn "Only ${mem} MB RAM and ${swap} MB swap (GATEKEEPER_SWAP=0: no swap file will be added). The image build can run out of memory."
     return 0
   fi
 
-  if ! confirm "Add a ${size} MB swap file so the build cannot run out of memory?" y; then
-    warn "Skipping swap. If the build gets 'Killed', re-run and accept the swap file."
-    return 0
+  warn "Only ${mem} MB RAM and ${swap} MB swap. Building the image can run out of memory on a server this small."
+  if [[ "${GATEKEEPER_SWAP:-}" != 1 ]] && interactive && ! $DRY_RUN; then
+    if ! confirm "Add a ${size} MB swap file so the build cannot run out of memory?" y; then
+      warn "Skipping swap. If the build gets 'Killed', re-run and accept the swap file."
+      return 0
+    fi
   fi
+  P_SWAP_MB=$size
+}
 
+create_swap() {
+  (( P_SWAP_MB > 0 )) || return 0
+  local path="$SWAP_FILE" size="$P_SWAP_MB" line idx
   info "Creating a ${size} MB swap file at $path"
+  jpush "Created a ${size} MB swap file at $path" rv_swap "$path"
+  idx=$J_LAST
+  J_KEEP[idx]=1
   if ! { fallocate -l "${size}M" "$path" 2>/dev/null || dd if=/dev/zero of="$path" bs=1M count="$size" status=none; }; then
-    rm -f "$path"; warn "Could not create the swap file; continuing without it."; return 0
+    rm -f "$path"; jdrop "$idx"; warn "Could not create the swap file; continuing without it."; return 0
   fi
   chmod 600 "$path"
   if mkswap "$path" >>"$LOG_FILE" 2>&1 && swapon "$path" >>"$LOG_FILE" 2>&1; then
-    grep -qs "^$path " /etc/fstab || printf '%s none swap sw 0 0\n' "$path" >>/etc/fstab
+    line="$path none swap sw 0 0"
+    if ! grep -qs "^$path " "$FSTAB_FILE"; then
+      jpush "Added the line '$line' to $FSTAB_FILE" rv_fstab_line "$FSTAB_FILE" "$line"
+      J_KEEP[J_LAST]=1
+      printf '%s\n' "$line" >>"$FSTAB_FILE"
+    fi
     ok "Swap enabled (${size} MB) and set to persist across reboots"
   else
     swapoff "$path" 2>/dev/null || true
     rm -f "$path"
+    jdrop "$idx"
     warn "This server does not allow swap (common on some virtualization types); continuing without it."
   fi
 }
@@ -684,17 +1147,18 @@ normalize_ip_list() {
   printf '%s' "${out[*]}"
 }
 
+# Random bytes come straight from the kernel, so no extra tool is needed to ask the questions.
 gen_alnum() { # gen_alnum LENGTH
   local len="$1" raw=""
   while (( ${#raw} < len )); do
-    raw+="$(openssl rand -base64 $((len * 3)) | tr -dc 'A-Za-z0-9')"
+    raw+="$(head -c $((len * 3)) /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
   done
   printf '%s' "${raw:0:len}"
 }
 
 # 32 random bytes, standard base64: what the README asks for (`openssl rand -base64 32`).
-gen_session_secret() { openssl rand -base64 32 | tr -d '\n'; }
-gen_hash_secret() { openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_' | tr -d '='; }
+gen_session_secret() { head -c 32 /dev/urandom | base64 | tr -d '\n'; }
+gen_hash_secret() { head -c 48 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='; }
 
 # -------------------------------------------------------------------------------------------------
 # Configuration model
@@ -717,7 +1181,7 @@ CFG_KEYS=(
 ENV_ACCEPTED_KEYS=(
   GATEKEEPER_MODE GATEKEEPER_DOMAIN ACME_EMAIL HA_BASE_URL HA_TOKEN ADMIN_PASSWORD
   ADMIN_SESSION_SECRET API_KEY_HASH_SECRET AUDIT_LOG_RETENTION_DAYS
-  ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL GATEKEEPER_PORT GATEKEEPER_DATA_DIR
+  ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL GATEKEEPER_PORT GATEKEEPER_DATA_DIR GATEKEEPER_PUBLIC_URL
 )
 
 # Keys that are only meaningful inside the compose project itself; empty ones are not written.
@@ -747,6 +1211,7 @@ cfg_load_file() { # cfg_load_file FILE
   done
 }
 
+GATEKEEPER_PORT_REQUESTED=""   # set when the user asked for a specific port (then it is never changed silently)
 cfg_load_environment() {
   local key
   for key in "${ENV_ACCEPTED_KEYS[@]}"; do
@@ -754,6 +1219,7 @@ cfg_load_environment() {
       CFG[$key]="${!key}"
     fi
   done
+  if [[ -n "${GATEKEEPER_PORT:-}" ]]; then GATEKEEPER_PORT_REQUESTED=1; fi
 }
 
 cfg_get() { printf '%s' "${CFG[$1]:-}"; }
@@ -782,9 +1248,17 @@ derive_config() {
       ;;
     *)
       CFG[COMPOSE_PROFILES]=""
-      CFG[TRUST_PROXY]=""
-      CFG[GATEKEEPER_PUBLIC_URL]="http://localhost:$port"
       CFG[GATEKEEPER_DOMAIN]=""
+      local pub="${CFG[GATEKEEPER_PUBLIC_URL]:-}"
+      if [[ "$pub" == https://* ]] && is_safe_url "$pub"; then
+        # Behind a web server you already run (nginx, Apache...): it terminates HTTPS and forwards
+        # to 127.0.0.1, one proxy hop, so client IPs are read from X-Forwarded-For.
+        CFG[GATEKEEPER_PUBLIC_URL]="https://$(url_authority "$pub")"
+        CFG[TRUST_PROXY]="1"
+      else
+        CFG[GATEKEEPER_PUBLIC_URL]="http://localhost:$port"
+        CFG[TRUST_PROXY]=""
+      fi
       ;;
   esac
   CFG[CORS_ORIGIN]="${CFG[GATEKEEPER_PUBLIC_URL]}"
@@ -860,10 +1334,17 @@ cfg_is_complete() { [[ -z "$(config_problems)" ]]; }
 
 # Writes .env atomically with mode 600. Keys the installer does not know are preserved verbatim.
 write_env_file() {
-  local file="$APP_DIR/.env" tmp key line extras=()
+  local file="$APP_DIR/.env" prev="$APP_DIR/.env.previous" tmp key line extras=() bak
   if [[ -f "$file" ]]; then
-    cp -p "$file" "$APP_DIR/.env.previous" 2>/dev/null || true
-    chmod 600 "$APP_DIR/.env.previous" 2>/dev/null || true
+    bak="$(jbackup "$file")"
+    jpush "Updated $file (the previous settings are put back on rollback)" rv_restore_env "$bak" "$STACK_PRE"
+    if [[ -e "$prev" ]]; then
+      jpush "Replaced $prev" rv_restore "$prev" "$(jbackup "$prev")"
+    else
+      jpush "Created $prev (copy of the old settings)" rv_rm "$prev"
+    fi
+    cp -p "$file" "$prev" 2>/dev/null || true
+    chmod 600 "$prev" 2>/dev/null || true
     while IFS= read -r line; do
       if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*= ]]; then
         key="${BASH_REMATCH[2]}"
@@ -895,7 +1376,43 @@ write_env_file() {
     fi
   } >"$tmp"
   chmod 600 "$tmp"
+  [[ -f "$file" ]] || jpush "Created $file (your settings and secrets, mode 600)" rv_rm "$file"
   mv -f "$tmp" "$file"
+}
+
+# The container reads its secrets from files, not environment variables (those show up in
+# `docker inspect` and /proc). .env stays the master copy; these files are rewritten from it
+# before every start. The folder is root-only; each file is readable by the app's user only.
+SECRETS_CHANGED=false   # a secret file was (re)written: a running container must be recreated to see it
+SECRET_FILE_MAP=(HA_TOKEN:ha_token ADMIN_PASSWORD:admin_password ADMIN_SESSION_SECRET:admin_session_secret API_KEY_HASH_SECRET:api_key_hash_secret)
+sync_secret_files() {
+  local dir="$APP_DIR/secrets" pair key name val path tmp dir_new=false
+  [[ -d "$dir" ]] || dir_new=true
+  jx_mkdir "$dir" tree
+  chown root:root "$dir" 2>/dev/null || true
+  chmod 700 "$dir"
+  for pair in "${SECRET_FILE_MAP[@]}"; do
+    key="${pair%%:*}"; name="${pair#*:}"
+    val="${CFG[$key]:-}"
+    if [[ -z "$val" ]]; then
+      err "$key is empty, so secrets/$name cannot be written."
+      return 1
+    fi
+    path="$dir/$name"
+    # A missing bind-mount source makes Docker create an (empty) folder in its place.
+    if [[ -d "$path" && ! -L "$path" ]]; then
+      rmdir "$path" 2>/dev/null || { err "$path is a folder and not empty; remove it and re-run."; return 1; }
+    fi
+    if [[ ! -f "$path" || "$(cat "$path" 2>/dev/null)" != "$val" ]]; then
+      $dir_new || [[ -e "$path" ]] || jpush "Created $path" rv_rm "$path"
+      tmp="$(mktemp "$dir/.s.XXXXXX")"
+      printf '%s' "$val" >"$tmp"
+      mv -f "$tmp" "$path"
+      SECRETS_CHANGED=true
+    fi
+    chmod 400 "$path"
+    chown "$SERVICE_UID:$SERVICE_UID" "$path" 2>/dev/null || chmod 444 "$path"
+  done
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -1026,7 +1543,7 @@ port_owner() { # best-effort name of the process listening on PORT
 
 # stack_publishes_port PORT -> 0 if our own Caddy container is what holds that port
 stack_publishes_port() {
-  have docker || return 1
+  docker_up || return 1
   docker inspect --type container --format '{{json .NetworkSettings.Ports}}' "$CADDY_CONTAINER" 2>/dev/null \
     | grep -q "\"$1/tcp\""
 }
@@ -1039,6 +1556,16 @@ have_systemd() { have systemctl && [[ -d /run/systemd/system ]]; }
 docker_ready() { timeout 20 docker info >/dev/null 2>&1; }
 compose_ok() { docker compose version >/dev/null 2>&1; }
 
+# True only when the Docker daemon is ALREADY running. Unlike docker_ready it never wakes a
+# stopped daemon: with systemd socket activation, merely running a docker command would start it.
+docker_up() {
+  have docker || return 1
+  if have_systemd && systemctl cat docker.service >/dev/null 2>&1; then
+    systemctl is-active --quiet docker.service || return 1
+  fi
+  docker_ready
+}
+
 compose_version_ok() {
   local v major
   v="$(docker compose version --short 2>/dev/null || true)"
@@ -1047,14 +1574,66 @@ compose_version_ok() {
   [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 2 ))
 }
 
+# What has to happen to Docker (read-only):  ok | install | start
+P_DOCKER=ok
+P_COMPOSE_NEEDED=false
+P_DOCKER_BOOT=false
+docker_plan() {
+  P_DOCKER=ok; P_COMPOSE_NEEDED=false; P_DOCKER_BOOT=false
+  if ! have docker; then
+    P_DOCKER=install
+    return 0
+  fi
+  if have_systemd && systemctl cat docker.service >/dev/null 2>&1; then
+    local state i
+    state="$(systemctl is-active docker.service 2>/dev/null || true)"
+    if [[ "$state" == activating ]]; then
+      for i in $(seq 1 15); do
+        sleep 2
+        state="$(systemctl is-active docker.service 2>/dev/null || true)"
+        [[ "$state" == activating ]] || break
+      done
+    fi
+    [[ "$state" == active ]] || P_DOCKER=start
+    systemctl is-enabled --quiet docker.service 2>/dev/null || P_DOCKER_BOOT=true
+  fi
+  if [[ "$P_DOCKER" == ok ]] && ! docker_ready; then P_DOCKER=start; fi
+  if ! { compose_ok && compose_version_ok; }; then P_COMPOSE_NEEDED=true; fi
+  return 0
+}
+
+# Docker is installed but stopped: starting it also starts every other container with a restart
+# policy, so this needs an explicit yes (unattended: GATEKEEPER_START_DOCKER=1).
+decide_docker_start() {
+  [[ "$P_DOCKER" == start ]] || return 0
+  $DRY_RUN && return 0
+  say ""
+  warn "Docker is installed on this server but not running."
+  say "  Starting it will ALSO START every other container here that has a restart policy (your other apps)."
+  if [[ "${GATEKEEPER_START_DOCKER:-}" == 1 ]]; then
+    say "  GATEKEEPER_START_DOCKER=1 is set, so that is allowed."
+  elif interactive; then
+    confirm "Start the Docker service now?" n || die "Cancelled. Nothing was changed. Start Docker yourself when you are ready, then run the installer again."
+  else
+    die "Docker is installed but stopped, and starting it would also start your other containers. Start it yourself, or set GATEKEEPER_START_DOCKER=1 to allow it. Nothing was changed."
+  fi
+}
+
 install_docker() {
-  local script
+  local script snap before had_d=0 had_c=0
   script="$(mktemp_tracked)"
   info "Installing Docker Engine (official installer from get.docker.com)"
   if ! retry 3 5 curl -fsSL --connect-timeout 10 --max-time 90 https://get.docker.com -o "$script"; then
     err "Could not download the Docker installer from get.docker.com"
     return 1
   fi
+  [[ -d /var/lib/docker ]] && had_d=1
+  [[ -d /var/lib/containerd ]] && had_c=1
+  snap="$(journal_tmp)/pkgs.docker"
+  before="$(journal_tmp)/files.docker"
+  pkg_snapshot "$snap" || : >"$snap"
+  find /etc/apt/sources.list.d /etc/apt/keyrings /usr/share/keyrings /etc/yum.repos.d -maxdepth 1 -type f 2>/dev/null | LC_ALL=C sort >"$before" || true
+  J_KEEP_NEXT=1 jpush "Installed Docker Engine (docker-ce, containerd and the Compose plugin, from get.docker.com)" rv_docker_engine "$snap" "$before" "$had_d" "$had_c"
   wait_for_apt_lock
   apt_lock_conf_on
   if run_logged "Running the Docker installer (takes a minute or two)" sh "$script"; then
@@ -1073,6 +1652,7 @@ install_docker() {
   esac
 }
 
+# Start the Docker service. Callers have the user's consent (or the user asked for it).
 start_docker() {
   docker_ready && return 0
   info "Starting the Docker service"
@@ -1096,7 +1676,7 @@ ensure_compose() {
   fi
 
   info "Docker Compose v2 not found; installing it"
-  pkg_install docker-compose-plugin >/dev/null 2>&1 || pkg_install docker-compose-v2 >/dev/null 2>&1 || true
+  jx_pkg_install docker-compose-plugin >/dev/null 2>&1 || jx_pkg_install docker-compose-v2 >/dev/null 2>&1 || true
   if compose_ok && compose_version_ok; then
     ok "Docker Compose $(docker compose version --short 2>/dev/null)"
     return 0
@@ -1111,8 +1691,9 @@ ensure_compose() {
   esac
   dest=/usr/local/lib/docker/cli-plugins
   url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$arch"
-  mkdir -p "$dest"
+  jx_mkdir "$dest"
   info "Downloading the Docker Compose plugin from GitHub"
+  [[ -e "$dest/docker-compose" ]] || { J_KEEP_NEXT=1 jpush "Downloaded the Docker Compose plugin to $dest/docker-compose" rv_rm "$dest/docker-compose"; }
   retry 3 5 curl -fsSL --connect-timeout 10 --max-time 180 -o "$dest/docker-compose" "$url" \
     || die "Could not download Docker Compose from $url"
   chmod +x "$dest/docker-compose"
@@ -1123,25 +1704,35 @@ ensure_compose() {
 }
 
 ensure_docker() {
-  if have docker; then
-    ok "Docker found: $(docker --version 2>/dev/null | head -n 1)"
-  else
+  if [[ "$P_DOCKER" == install ]]; then
     have curl || die "curl is required to install Docker"
     install_docker || die "Docker could not be installed automatically. Install Docker Engine (https://docs.docker.com/engine/install/) and re-run this script."
     have docker || die "Docker was installed but the 'docker' command is not on PATH."
     ok "Docker installed"
+  else
+    ok "Docker found: $(docker --version 2>/dev/null | head -n 1)"
   fi
   DOCKER_BIN="$(command -v docker)"
-  start_docker
+  if [[ "$P_DOCKER" == start ]]; then
+    J_KEEP_NEXT=1 jpush "Started the Docker service (it was stopped; this also started your other containers)" rv_note "Docker was left running: stopping it would stop your other containers too"
+    start_docker
+  else
+    start_docker
+  fi
   ensure_compose
 
   if have_systemd; then
     if systemctl is-enabled docker >/dev/null 2>&1; then
       ok "Docker starts automatically at boot"
-    elif systemctl enable docker >>"$LOG_FILE" 2>&1; then
-      ok "Enabled Docker at boot"
     else
-      warn "Could not enable Docker at boot (systemctl enable docker failed)."
+      jpush "Enabled the Docker service at boot" rv_docker_boot_disable
+      J_KEEP[J_LAST]=1
+      if systemctl enable docker >>"$LOG_FILE" 2>&1; then
+        ok "Enabled Docker at boot"
+      else
+        jdrop "$J_LAST"
+        warn "Could not enable Docker at boot (systemctl enable docker failed)."
+      fi
     fi
   fi
 }
@@ -1176,13 +1767,17 @@ needed_images() {
 # official images are also served by other registries, so fall back to those and retag.
 pull_with_fallback() {
   local image="$1" name mirror first
+  local idx
   if docker image inspect "$image" >/dev/null 2>&1; then
     log_file "image already present: $image"
     return 0
   fi
+  J_KEEP_NEXT=1 jpush "Downloaded the Docker image $image" rv_image_rm "$image"
+  idx=$J_LAST
   if retry 3 6 docker pull -q "$image" >>"$LOG_FILE" 2>&1; then
     return 0
   fi
+  jdrop "$idx"
 
   first="${image%%/*}"
   if [[ "$image" == */* && ( "$first" == *.* || "$first" == *:* ) ]]; then
@@ -1192,10 +1787,13 @@ pull_with_fallback() {
   [[ "$image" == */* ]] || name="library/$image"
   for mirror in mirror.gcr.io public.ecr.aws/docker; do
     warn "Pulling $image from Docker Hub failed; trying $mirror"
+    J_KEEP_NEXT=1 jpush "Downloaded the Docker image $image (via $mirror)" rv_image_rm "$image" "$mirror/$name"
+    idx=$J_LAST
     if docker pull -q "$mirror/$name" >>"$LOG_FILE" 2>&1 && docker tag "$mirror/$name" "$image"; then
       ok "Got $image via $mirror"
       return 0
     fi
+    jdrop "$idx"
   done
   return 1
 }
@@ -1250,6 +1848,9 @@ diagnose_build_failure() {
 
 compose_build() {
   local attempt
+  if ! docker image inspect ha-gatekeeper:local >/dev/null 2>&1; then
+    jpush "Built the Docker image ha-gatekeeper:local" rv_image_rm ha-gatekeeper:local
+  fi
   for attempt in 1 2 3; do
     if run_logged "Building the Gatekeeper image (attempt $attempt/3; the first build takes a few minutes)" dc build gatekeeper; then
       return 0
@@ -1283,7 +1884,7 @@ wait_for_container() {
 fix_data_permissions() {
   local data
   data="$(data_dir_abs)"
-  mkdir -p "$data"
+  jx_mkdir "$data" tree
   if chown -R "$SERVICE_UID:$SERVICE_UID" "$data" 2>>"$LOG_FILE"; then
     chmod 750 "$data"
   else
@@ -1328,6 +1929,24 @@ diagnose_gatekeeper() {
   return 0
 }
 
+# Record that this run is about to (re)start the containers, and which Docker volumes it creates.
+STACK_PRE=0            # 1 when the stack was already installed before this run
+journal_stack_start() {
+  local proj="${CFG[COMPOSE_PROJECT_NAME]:-ha-gatekeeper}" v names="$GK_CONTAINER"
+  proxy_enabled && names="$names, $CADDY_CONTAINER"
+  if proxy_enabled; then
+    for v in caddy_data caddy_config; do
+      docker volume inspect "${proj}_$v" >/dev/null 2>&1 && continue
+      if [[ "${CFG[GATEKEEPER_MODE]:-}" == domain ]]; then
+        jpush "Created the Docker volume ${proj}_$v (HTTPS certificates)" rv_note "kept the HTTPS certificate volume ${proj}_$v because Let's Encrypt limits how often certificates can be re-issued; remove it with: docker volume rm ${proj}_$v"
+      else
+        jpush "Created the Docker volume ${proj}_$v" rv_volume_rm "${proj}_$v"
+      fi
+    done
+  fi
+  jpush "Started the containers: $names" rv_stack_down "$STACK_PRE"
+}
+
 remove_proxy_if_disabled() {
   proxy_enabled && return 0
   if docker inspect --type container "$CADDY_CONTAINER" >/dev/null 2>&1; then
@@ -1339,9 +1958,13 @@ remove_proxy_if_disabled() {
 # start_stack -> builds if needed, starts, waits for health; auto-repairs the common failures
 start_stack() {
   remove_proxy_if_disabled
-  local attempt
+  sync_secret_files || return 1
+  journal_stack_start
+  local attempt had_container=false
+  docker inspect --type container "$GK_CONTAINER" >/dev/null 2>&1 && had_container=true
   for attempt in 1 2; do
-    if run_logged "Starting the containers" dc up -d --remove-orphans; then
+    if run_logged "Starting the containers" dc up -d --remove-orphans \
+      && { ! $SECRETS_CHANGED || ! $had_container || dc up -d --force-recreate --no-deps gatekeeper >>"$LOG_FILE" 2>&1; }; then
       if wait_for_container "$GK_CONTAINER" 120; then
         ok "Gatekeeper container is running and healthy"
         return 0
@@ -1403,7 +2026,7 @@ validate_caddyfile() { # validate_caddyfile FILE -> checks it with the real Cadd
 CADDY_CHANGED=false
 write_caddyfile() {
   local dir="$APP_DIR/deploy/caddy" tmp
-  mkdir -p "$dir"
+  jx_mkdir "$dir"
   if ! proxy_enabled; then
     return 0
   fi
@@ -1419,7 +2042,7 @@ write_caddyfile() {
   if [[ -f "$dir/Caddyfile" ]] && cmp -s "$tmp" "$dir/Caddyfile"; then
     CADDY_CHANGED=false
   else
-    mv -f "$tmp" "$dir/Caddyfile"
+    jx_install_file "$tmp" "$dir/Caddyfile" 644
     CADDY_CHANGED=true
   fi
 }
@@ -1471,55 +2094,106 @@ ha_local_port() {
   printf '%s' "$port"
 }
 
-maybe_enable_ufw() {
+# Does ufw already have this rule (ignoring the comment)? Rules that already exist are never
+# re-added, never recorded, and therefore never removed by a rollback.
+ufw_has_rule() { # ufw_has_rule "allow 80/tcp"
+  have ufw || return 1
+  ufw show added 2>/dev/null | sed -E "s/ comment '.*'$//" | grep -qxF "ufw $1"
+}
+
+# fw_ufw_allow COMMENT SPEC...   e.g.  fw_ufw_allow 'HA Gatekeeper HTTP' 80/tcp
+fw_ufw_allow() {
+  local comment="$1"
+  shift
+  ufw_has_rule "allow $*" && return 0
+  jpush "Added the ufw rule: allow $*" rv_ufw_delete allow "$@"
+  ufw allow "$@" comment "$comment" >>"$LOG_FILE" 2>&1
+}
+
+# Decide (without changing anything) whether to switch ufw on. Turning on a firewall blocks every
+# port that is not allowed, so it is always an explicit choice: never implied by --yes.
+P_UFW_ENABLE=false
+P_UFW_SSH_PORTS=""
+ufw_decide() {
+  P_UFW_ENABLE=false
+  P_UFW_SSH_PORTS=""
   have ufw || return 0
   ufw_active && return 0
   [[ "${CFG[GATEKEEPER_MODE]}" == local ]] && return 0
-  local ports p
+  [[ "${GATEKEEPER_UFW:-}" == 0 ]] && return 0
+  local ports
   ports="$(ssh_ports)"
   if [[ -z "$ports" ]]; then
     hint "The host firewall (ufw) is off. It could not be enabled safely because the SSH port could not be detected."
     return 0
   fi
-  if [[ "${GATEKEEPER_UFW:-}" == 0 ]]; then return 0; fi
   if [[ "${GATEKEEPER_UFW:-}" != 1 ]]; then
     interactive || return 0
+    $DRY_RUN && return 0
+    say ""
     say "  The server firewall (ufw) is switched off, so anything else listening on this server is reachable."
     say "  ${C_DIM}I can turn it on allowing only: SSH (port $ports), 80, 443. Other services on this server would be blocked.${C_RESET}"
-    confirm "Turn the firewall on now?" y || return 0
+    confirm "Turn the firewall on now?" n || return 0
   fi
-  for p in $ports; do ufw allow "$p/tcp" comment 'SSH (HA Gatekeeper installer)' >>"$LOG_FILE" 2>&1 || return 0; done
-  ufw allow 80/tcp comment 'HA Gatekeeper HTTP' >>"$LOG_FILE" 2>&1 || true
-  ufw allow 443/tcp comment 'HA Gatekeeper HTTPS' >>"$LOG_FILE" 2>&1 || true
-  ufw allow 443/udp comment 'HA Gatekeeper HTTP/3' >>"$LOG_FILE" 2>&1 || true
+  P_UFW_ENABLE=true
+  P_UFW_SSH_PORTS="$ports"
+}
+
+enable_ufw() {
+  $P_UFW_ENABLE || return 0
+  local p
+  for p in $P_UFW_SSH_PORTS; do
+    J_KEEP_NEXT=1 fw_ufw_allow 'SSH (HA Gatekeeper installer)' "$p/tcp" || return 0
+  done
+  fw_ufw_allow 'HA Gatekeeper HTTP' 80/tcp || true
+  fw_ufw_allow 'HA Gatekeeper HTTPS' 443/tcp || true
+  fw_ufw_allow 'HA Gatekeeper HTTP/3' 443/udp || true
+  J_KEEP_NEXT=1 jpush "Turned on the ufw firewall (it was off)" rv_ufw_disable
   if ufw --force enable >>"$LOG_FILE" 2>&1; then
-    ok "Firewall (ufw) enabled: SSH ($ports), 80 and 443 allowed"
+    ok "Firewall (ufw) enabled: SSH ($P_UFW_SSH_PORTS), 80 and 443 allowed"
   else
+    jdrop "$J_LAST"
     warn "Could not enable ufw."
   fi
+}
+
+# firewalld equivalents; only what is missing is added and recorded.
+fw_firewalld_add() { # fw_firewalld_add service|port|rich VALUE
+  local kind="$1" value="$2"
+  case "$kind" in
+    service) firewall-cmd --permanent --query-service="$value" >/dev/null 2>&1 && return 0; jpush "Added the firewalld service: $value" rv_firewalld service "$value"; firewall-cmd --permanent --add-service="$value" >>"$LOG_FILE" 2>&1 ;;
+    port) firewall-cmd --permanent --query-port="$value" >/dev/null 2>&1 && return 0; jpush "Added the firewalld port: $value" rv_firewalld port "$value"; firewall-cmd --permanent --add-port="$value" >>"$LOG_FILE" 2>&1 ;;
+    rich) firewall-cmd --permanent --query-rich-rule="$value" >/dev/null 2>&1 && return 0; jpush "Added the firewalld rule: $value" rv_firewalld rich "$value"; firewall-cmd --permanent --add-rich-rule="$value" >>"$LOG_FILE" 2>&1 ;;
+  esac
 }
 
 open_firewall() {
   local touched=false hp
   hp="$(ha_local_port || true)"
 
+  if [[ "${GATEKEEPER_UFW:-}" == 0 ]]; then
+    hint "GATEKEEPER_UFW=0: the host firewall was not touched."
+    [[ "${CFG[GATEKEEPER_MODE]}" == local ]] || hint "If you use one, allow inbound TCP 80 and 443 yourself."
+    [[ -z "$hp" ]] || hint "Home Assistant is on this server: allow the Docker networks to reach it, for example: ufw allow from 172.16.0.0/12 to any port $hp proto tcp"
+    return 0
+  fi
+
   if [[ "${CFG[GATEKEEPER_MODE]}" != local ]]; then
-    maybe_enable_ufw
+    enable_ufw
     if ufw_active; then
-      if ufw allow 80/tcp comment 'HA Gatekeeper HTTP' >>"$LOG_FILE" 2>&1 \
-        && ufw allow 443/tcp comment 'HA Gatekeeper HTTPS' >>"$LOG_FILE" 2>&1 \
-        && ufw allow 443/udp comment 'HA Gatekeeper HTTP/3' >>"$LOG_FILE" 2>&1; then
-        ok "ufw firewall: opened ports 80 and 443"
+      if fw_ufw_allow 'HA Gatekeeper HTTP' 80/tcp \
+        && fw_ufw_allow 'HA Gatekeeper HTTPS' 443/tcp \
+        && fw_ufw_allow 'HA Gatekeeper HTTP/3' 443/udp; then
+        ok "ufw firewall: ports 80 and 443 are open"
       else
         warn "Could not add ufw rules. Run: ufw allow 80/tcp && ufw allow 443/tcp && ufw allow 443/udp"
       fi
       touched=true
     fi
     if firewalld_active; then
-      if firewall-cmd --permanent --add-service=http --add-service=https >>"$LOG_FILE" 2>&1 \
-        && firewall-cmd --permanent --add-port=443/udp >>"$LOG_FILE" 2>&1 \
-        && firewall-cmd --reload >>"$LOG_FILE" 2>&1; then
-        ok "firewalld: opened http/https"
+      if fw_firewalld_add service http && fw_firewalld_add service https \
+        && fw_firewalld_add port 443/udp && firewall-cmd --reload >>"$LOG_FILE" 2>&1; then
+        ok "firewalld: http/https are open"
       else
         warn "Could not update firewalld. Allow the http and https services manually."
       fi
@@ -1531,16 +2205,16 @@ open_firewall() {
 
   if [[ -n "$hp" ]]; then
     if ufw_active; then
-      if ufw allow from 172.16.0.0/12 to any port "$hp" proto tcp comment 'HA Gatekeeper -> Home Assistant' >>"$LOG_FILE" 2>&1; then
-        ok "ufw: let the Gatekeeper container reach Home Assistant on port $hp (Docker networks only)"
+      if fw_ufw_allow 'HA Gatekeeper -> Home Assistant' from 172.16.0.0/12 to any port "$hp" proto tcp; then
+        ok "ufw: the Gatekeeper container may reach Home Assistant on port $hp (Docker networks only)"
       else
         warn "Could not add the ufw rule. Run: ufw allow from 172.16.0.0/12 to any port $hp proto tcp"
       fi
     fi
     if firewalld_active; then
-      if firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=172.16.0.0/12 port port=$hp protocol=tcp accept" >>"$LOG_FILE" 2>&1 \
+      if fw_firewalld_add rich "rule family=ipv4 source address=172.16.0.0/12 port port=$hp protocol=tcp accept" \
         && firewall-cmd --reload >>"$LOG_FILE" 2>&1; then
-        ok "firewalld: let the Gatekeeper container reach Home Assistant on port $hp"
+        ok "firewalld: the Gatekeeper container may reach Home Assistant on port $hp"
       else
         warn "Could not add the firewalld rule for Home Assistant port $hp."
       fi
@@ -1579,17 +2253,19 @@ pause_watchdog_for_maintenance() {
 }
 
 write_unit() { # write_unit NAME   (unit text on stdin)
-  local path="$SYSTEMD_DIR/$1"
-  cat >"$path.tmp"
-  mv -f "$path.tmp" "$path"
-  chmod 644 "$path"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  jx_install_file "$tmp" "$SYSTEMD_DIR/$1" 644
+  rm -f "$tmp"
 }
 
 install_systemd_units() {
   if [[ "$APP_DIR" =~ [[:space:]\"\'\\%$] ]]; then
     die "The install path must not contain spaces or special characters: $APP_DIR"
   fi
-  mkdir -p "$SYSTEMD_DIR"
+  jx_mkdir "$SYSTEMD_DIR"
+  jpush "Reloaded the systemd configuration" rv_daemon_reload
 
   write_unit ha-gatekeeper.service <<EOF
 [Unit]
@@ -1663,6 +2339,10 @@ Unit=ha-gatekeeper-backup.service
 WantedBy=timers.target
 EOF
 
+  local u
+  for u in ha-gatekeeper.service ha-gatekeeper-watchdog.timer ha-gatekeeper-backup.timer; do
+    systemctl is-enabled --quiet "$u" 2>/dev/null || jpush "Enabled and started $u" rv_unit_disable "$u"
+  done
   systemctl daemon-reload
   systemctl enable ha-gatekeeper.service ha-gatekeeper-watchdog.timer ha-gatekeeper-backup.timer >>"$LOG_FILE" 2>&1
   systemctl restart ha-gatekeeper-watchdog.timer ha-gatekeeper-backup.timer >>"$LOG_FILE" 2>&1
@@ -1675,7 +2355,7 @@ install_cron_fallback() {
   dir="$(dirname "$CRON_FILE")"
   if [[ ! -d "$dir" ]]; then
     info "No systemd on this server: installing cron for the watchdog"
-    pkg_install cron >/dev/null 2>&1 || pkg_install cronie >/dev/null 2>&1 || true
+    jx_pkg_install cron >/dev/null 2>&1 || jx_pkg_install cronie >/dev/null 2>&1 || true
   fi
   if [[ ! -d "$dir" ]]; then
     warn "There is neither systemd nor cron, so the watchdog cannot be scheduled automatically."
@@ -1683,7 +2363,9 @@ install_cron_fallback() {
     return 1
   fi
 
-  cat >"$CRON_FILE" <<EOF
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
 # HA Gatekeeper: watchdog every minute, start at boot, daily backup. Managed by install.sh.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -1691,7 +2373,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 @reboot root sleep 30 && cd $APP_DIR && $DOCKER_BIN compose up -d --remove-orphans >/dev/null 2>&1
 30 3 * * * root $APP_DIR/install.sh backup --quiet >/dev/null 2>&1
 EOF
-  chmod 644 "$CRON_FILE"
+  jx_install_file "$tmp" "$CRON_FILE" 644
+  rm -f "$tmp"
 
   if have service; then
     service cron start >>"$LOG_FILE" 2>&1 || service crond start >>"$LOG_FILE" 2>&1 || true
@@ -1699,22 +2382,41 @@ EOF
   ok "cron: watchdog every minute, start at boot, daily backup ($CRON_FILE)"
 }
 
+# The folder for the watchdog's state (heartbeat, pause flag); created once per server.
+ensure_state_dir() {
+  jx_mkdir "$STATE_DIR" tree
+  chmod 700 "$STATE_DIR"
+}
+
 install_automation() {
   chmod +x "$APP_DIR/install.sh" "$APP_DIR/deploy/watchdog.sh"
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
+  ensure_state_dir
+  [[ -e "$WATCHDOG_LOG" ]] || jpush "Created the watchdog log $WATCHDOG_LOG (filled in by the watchdog)" rv_rm "$WATCHDOG_LOG"
 
   if have_systemd; then
-    rm -f "$CRON_FILE" 2>/dev/null || true
+    if [[ -e "$CRON_FILE" ]]; then
+      jpush "Removed the old cron file $CRON_FILE (systemd is used instead)" rv_restore "$CRON_FILE" "$(jbackup "$CRON_FILE")"
+      rm -f "$CRON_FILE" 2>/dev/null || true
+    fi
     install_systemd_units
   else
     install_cron_fallback || true
   fi
 
-  if ln -sf "$APP_DIR/install.sh" "$BIN_LINK" 2>/dev/null; then
-    ok "Installed the 'gatekeeper' command ($BIN_LINK): try  gatekeeper status"
+  if [[ -L "$BIN_LINK" && "$(readlink "$BIN_LINK")" == "$APP_DIR/install.sh" ]]; then
+    ok "The 'gatekeeper' command is installed ($BIN_LINK)"
   else
-    warn "Could not create $BIN_LINK; run $APP_DIR/install.sh directly."
+    if [[ -e "$BIN_LINK" || -L "$BIN_LINK" ]]; then
+      jpush "Replaced $BIN_LINK (the previous one is put back on rollback)" rv_restore "$BIN_LINK" "$(jbackup "$BIN_LINK")"
+    else
+      jpush "Created the 'gatekeeper' command $BIN_LINK (a link to $APP_DIR/install.sh)" rv_rm "$BIN_LINK"
+    fi
+    if ln -sf "$APP_DIR/install.sh" "$BIN_LINK" 2>/dev/null; then
+      ok "Installed the 'gatekeeper' command ($BIN_LINK): try  gatekeeper status"
+    else
+      jdrop "$J_LAST"
+      warn "Could not create $BIN_LINK; run $APP_DIR/install.sh directly."
+    fi
   fi
 }
 
@@ -1725,6 +2427,7 @@ install_automation() {
 V_PASS=0
 V_WARN=0
 V_FAIL=0
+V_FAIL_DEFERRED=0      # failures that only mean "not ready yet" (a certificate still being issued)
 JUST_INSTALLED=false
 
 HTTP_COOKIE=""
@@ -1745,6 +2448,7 @@ vwarn() {
   [[ -z "${2:-}" ]] || printf '         %s-> %s%s\n' "$C_DIM" "$2" "$C_RESET"
   log_file "WARN  $1 | ${2:-}"
 }
+vfail_deferred() { V_FAIL_DEFERRED=$((V_FAIL_DEFERRED + 1)); vfail "$@"; }
 vfail() {
   V_FAIL=$((V_FAIL + 1))
   printf '  %s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$1"
@@ -1860,7 +2564,7 @@ verify_host() {
 
 verify_docker() {
   vsection "Docker"
-  if docker_ready; then
+  if docker_up; then
     vpass "Docker daemon is responding ($(docker version --format '{{.Server.Version}}' 2>/dev/null))"
   else
     vfail "Docker daemon is not responding" "systemctl status docker; journalctl -u docker -n 50"
@@ -1940,7 +2644,8 @@ verify_ha_from_container() {
   errf="$(mktemp_tracked)"
   out="$(docker exec "$GK_CONTAINER" node -e '
     const base = (process.env.HA_BASE_URL || "").replace(/\/$/, "");
-    fetch(base + "/api/config", { headers: { Authorization: "Bearer " + process.env.HA_TOKEN }, signal: AbortSignal.timeout(15000) })
+    const token = process.env.HA_TOKEN || require("fs").readFileSync(process.env.HA_TOKEN_FILE, "utf8").trim();
+    fetch(base + "/api/config", { headers: { Authorization: "Bearer " + token }, signal: AbortSignal.timeout(15000) })
       .then(async (r) => {
         const j = r.ok ? await r.json().catch(() => ({})) : {};
         console.log(JSON.stringify({ status: r.status, version: j.version, name: j.location_name }));
@@ -1981,6 +2686,44 @@ verify_ha_from_container() {
       *CERT*|*SELF_SIGNED*|*certificate*) vfail "TLS certificate problem talking to Home Assistant ($why)" "Provide the CA file for a private certificate: sudo $APP_DIR/install.sh --reconfigure (advanced options)." ;;
       *) vfail "Container could not reach Home Assistant (${why:-no details})" "gatekeeper logs" ;;
     esac
+  fi
+}
+
+verify_secrets() {
+  vsection "Secrets"
+  local env_json key leaked=() dir="$APP_DIR/secrets"
+  env_json="$(docker inspect --type container -f '{{json .Config.Env}}' "$GK_CONTAINER" 2>/dev/null || true)"
+  if [[ -n "$env_json" ]]; then
+    for key in HA_TOKEN ADMIN_PASSWORD ADMIN_SESSION_SECRET API_KEY_HASH_SECRET; do
+      if grep -qF "\"$key=" <<<"$env_json"; then leaked+=("$key"); fi
+    done
+    if (( ${#leaked[@]} > 0 )); then
+      vfail "These secrets are visible in the container's environment (docker inspect): ${leaked[*]}" "Re-run the installer to recreate the container: sudo $APP_DIR/install.sh"
+    else
+      vpass "No secret is in the container's environment (docker inspect and /proc/1/environ show none)"
+    fi
+  fi
+  if [[ -d "$dir" ]]; then
+    if [[ "$(stat -c '%a %u' "$dir")" == "700 0" ]]; then
+      vpass "The secrets folder is private (mode 700, owned by root)"
+    else
+      vwarn "The secrets folder permissions are $(stat -c '%a' "$dir") (owner uid $(stat -c '%u' "$dir"))" "chmod 700 $dir && chown root:root $dir"
+    fi
+  else
+    vfail "No $dir folder" "Run: sudo $APP_DIR/install.sh"
+  fi
+}
+
+# Private mode behind your own web server: check that the public address really reaches the app.
+verify_behind_proxy() {
+  [[ "${CFG[GATEKEEPER_MODE]}" == local && "${CFG[GATEKEEPER_PUBLIC_URL]:-}" == https://* ]] || return 0
+  vsection "Your web server"
+  local url="${CFG[GATEKEEPER_PUBLIC_URL]}"
+  HTTP_COOKIE=""; HTTP_BEARER=""
+  if http_do GET "$url/healthz" "" --max-time 15 && [[ "$LAST_CODE" == 200 && "$LAST_BODY" == *'"ok":true'* ]]; then
+    vpass "$url reaches Gatekeeper through your web server"
+  else
+    vwarn "$url does not reach Gatekeeper yet (${LAST_ERR:-HTTP ${LAST_CODE:-none}})" "Forward it to http://127.0.0.1:${CFG[GATEKEEPER_PORT]} (the summary shows an nginx example), reload your web server, then run: gatekeeper verify"
   fi
 }
 
@@ -2128,7 +2871,7 @@ caddy_tls_hint() {
   elif grep -qiE 'rateLimited|too many (certificates|failed)|rate limit' <<<"$logs"; then
     hint "Let's Encrypt is rate-limiting this domain. Wait an hour (failed attempts) or a week (certificates) and it will retry by itself."
   elif grep -qiE 'unauthorized|Invalid response|wrong' <<<"$logs"; then
-    hint "Something other than Caddy answered on port 80. Stop any other web server (nginx/apache) using ports 80/443."
+    hint "Something other than Caddy answered on port 80 (another web server?). This installer never stops other services: use private mode (3) behind that server instead."
   else
     hint "Last proxy log lines:"
     tail -n 6 <<<"$logs" | sed 's/^/       | /'
@@ -2154,7 +2897,11 @@ verify_public() {
   elif $ok; then
     vpass "https://$host answers (self-signed certificate: browsers warn once)"
   else
-    vfail "HTTPS does not work yet for $host (${LAST_ERR:-HTTP $LAST_CODE})" "The app itself is fine; the proxy has no certificate."
+    if [[ "$mode" == domain ]]; then
+      vfail_deferred "HTTPS does not work yet for $host (${LAST_ERR:-HTTP $LAST_CODE})" "The app itself is fine; the proxy has no certificate yet. It keeps retrying by itself."
+    else
+      vfail "HTTPS does not work for $host (${LAST_ERR:-HTTP $LAST_CODE})" "The app itself is fine; the proxy is not answering."
+    fi
     caddy_tls_hint
     return 0
   fi
@@ -2363,21 +3110,26 @@ verify_summary() {
     printf '%sHandy: gatekeeper logs | gatekeeper status | %s%s\n' "$C_DIM" "$LOG_FILE" "$C_RESET"
   fi
   log_file "verify: $V_PASS passed, $V_WARN warnings, $V_FAIL failed"
-  (( V_FAIL == 0 ))
+  return 0
 }
 
 verify_all() { # verify_all [with-drill]
   V_PASS=0; V_WARN=0; V_FAIL=0
   local drill="${1:-}"
+  V_FAIL_DEFERRED=0
   verify_host
-  verify_docker || { verify_summary || true; return 1; }
+  verify_docker || { verify_summary; return 1; }
   verify_containers
+  verify_secrets
   verify_app
-  if proxy_enabled; then verify_public; fi
+  if proxy_enabled; then verify_public; else verify_behind_proxy; fi
   verify_automation
   verify_data
   if [[ "$drill" == with-drill ]]; then run_drill; fi
+  if [[ "${GK_FAIL_AT:-}" == verify ]]; then vfail "Forced failure (GK_FAIL_AT=verify, a test hook)"; fi
   verify_summary
+  (( V_FAIL == 0 )) || return 1
+  return 0
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -2388,7 +3140,7 @@ PUBLIC_IPV4=""
 FRESH_INSTALL=true
 
 container_publishes_host_port() { # container_publishes_host_port NAME PORT
-  have docker || return 1
+  docker_up || return 1
   docker inspect --type container --format '{{json .NetworkSettings.Ports}}' "$1" 2>/dev/null \
     | grep -q "\"HostPort\":\"$2\""
 }
@@ -2397,6 +3149,9 @@ pick_app_port() {
   local p="${CFG[GATEKEEPER_PORT]:-8080}" tries=0 owner
   while port_in_use "$p" && ! container_publishes_host_port "$GK_CONTAINER" "$p"; do
     owner="$(port_owner "$p" || true)"
+    if [[ -n "${GATEKEEPER_PORT_REQUESTED:-}" ]]; then
+      die "The port you asked for (GATEKEEPER_PORT=$p) is already in use${owner:+ by $owner}. Pick another port, or free it yourself. Nothing was changed."
+    fi
     warn "Local port $p is already in use${owner:+ by $owner}; trying the next one."
     p=$((p + 1))
     tries=$((tries + 1))
@@ -2405,18 +3160,31 @@ pick_app_port() {
   CFG[GATEKEEPER_PORT]="$p"
 }
 
-check_web_ports() {
-  proxy_enabled || return 0
-  local p owner bad=false
+# Ports 80/443 that something else already uses (our own proxy container does not count).
+web_ports_taken() { # prints "80 (nginx (pid 12))" style lines
+  local p owner
   for p in 80 443; do
     if port_in_use "$p" && ! stack_publishes_port "$p"; then
       owner="$(port_owner "$p" || true)"
-      err "Port $p is already in use${owner:+ by $owner}. HTTPS needs ports 80 and 443."
-      bad=true
+      printf '%s%s\n' "$p" "${owner:+ ($owner)}"
     fi
   done
-  if $bad; then
-    hint "Free them (for example: systemctl disable --now nginx apache2 caddy) and re-run, or pick the private SSH-tunnel option."
+  return 0
+}
+
+# HTTPS modes (1 and 2) need ports 80 and 443 for themselves. If another server (nginx, Apache...)
+# owns them, refuse: this installer never stops, reconfigures or works around another service.
+check_web_ports() {
+  proxy_enabled || return 0
+  local taken
+  taken="$(web_ports_taken)"
+  if [[ -n "$taken" ]]; then
+    err "Port(s) already in use by another program: $(tr '\n' ' ' <<<"$taken")"
+    say "  HTTPS options 1 and 2 need ports 80 and 443 for themselves, and this installer never stops or changes"
+    say "  another web server. Nothing was changed. Your choices:"
+    say "    - Choose option 3 (private) and let your existing web server forward HTTPS to Gatekeeper at"
+    say "      http://127.0.0.1:${CFG[GATEKEEPER_PORT]:-8080}  (the summary shows a ready-made nginx snippet), or"
+    say "    - free ports 80 and 443 yourself, then run this installer again."
     return 1
   fi
   ok "Ports 80 and 443 are free for the HTTPS proxy"
@@ -2424,12 +3192,12 @@ check_web_ports() {
 
 install_ha_ca() { # install_ha_ca HOSTFILE
   local src="$1"
-  if ! openssl x509 -in "$src" -noout >/dev/null 2>&1; then
+  if have openssl && ! openssl x509 -in "$src" -noout >/dev/null 2>&1; then
     err "$src is not a PEM-encoded certificate."
     return 1
   fi
-  mkdir -p "$APP_DIR/deploy/certs"
-  install -m 644 "$src" "$APP_DIR/deploy/certs/ha-ca.pem"
+  jx_mkdir "$APP_DIR/deploy/certs"
+  jx_install_file "$src" "$APP_DIR/deploy/certs/ha-ca.pem" 644
   CFG[HA_CA_CERT]="/certs/ha-ca.pem"
 }
 
@@ -2512,10 +3280,12 @@ dns_check() { # dns_check DOMAIN
 }
 
 wizard_mode() {
-  local ip choice default cur="${CFG[GATEKEEPER_MODE]:-}"
-  ip="$(public_ip 4 || true)"
+  local ip choice default cur="${CFG[GATEKEEPER_MODE]:-}" taken
+  have curl && ip="$(public_ip 4 || true)" || ip=""
   PUBLIC_IPV4="$ip"
   case "$cur" in domain) default=1 ;; selfsigned) default=2 ;; local) default=3 ;; *) default=2 ;; esac
+  taken="$(web_ports_taken)"
+  [[ -z "$taken" ]] || default=3
 
   say ""
   say "${C_BOLD}How do you want to reach HA Gatekeeper (admin page and API)?${C_RESET}"
@@ -2527,17 +3297,45 @@ wizard_mode() {
   say "                                   ${C_DIM}warn once, and API clients must be told to trust it.${C_RESET}"
   say "  3) Private (SSH tunnel only)     ${C_DIM}Nothing is exposed to the internet; you connect with ssh -L.${C_RESET}"
   say ""
-  say "  ${C_DIM}Not sure? Choose 2: it works immediately with just the server's IP address. You can switch to a${C_RESET}"
-  say "  ${C_DIM}domain later by running  sudo gatekeeper install --reconfigure .${C_RESET}"
+  if [[ -n "$taken" ]]; then
+    say "  ${C_YELLOW}Ports 80/443 are already used by another program here ($(tr '\n' ' ' <<<"$taken")).${C_RESET}"
+    say "  ${C_DIM}Options 1 and 2 need those ports and this installer never stops another web server, so they are unavailable.${C_RESET}"
+    say "  ${C_DIM}Choose 3 and let your existing web server forward HTTPS to Gatekeeper (you will be asked for its address).${C_RESET}"
+  else
+    say "  ${C_DIM}Not sure? Choose 2: it works immediately with just the server's IP address. You can switch to a${C_RESET}"
+    say "  ${C_DIM}domain later by running  sudo gatekeeper install --reconfigure .${C_RESET}"
+  fi
   say ""
   while true; do
     choice="$(ask "Choose 1, 2 or 3" "$default")"
     case "$choice" in
-      1) CFG[GATEKEEPER_MODE]=domain; return ;;
-      2) CFG[GATEKEEPER_MODE]=selfsigned; return ;;
+      1|2)
+        if [[ -n "$taken" ]]; then warn "Ports 80/443 are in use by another program. Please choose 3."; continue; fi
+        if [[ "$choice" == 1 ]]; then CFG[GATEKEEPER_MODE]=domain; else CFG[GATEKEEPER_MODE]=selfsigned; fi
+        return ;;
       3) CFG[GATEKEEPER_MODE]=local; return ;;
     esac
     warn "Please type 1, 2 or 3."
+  done
+}
+
+# Private mode: an HTTPS web server you already run (nginx, Apache, Traefik...) may forward to us.
+wizard_behind_proxy() {
+  local v cur="${CFG[GATEKEEPER_PUBLIC_URL]:-}"
+  [[ "$cur" == https://* ]] || cur=""
+  say ""
+  say "${C_BOLD}Do you already run a web server with HTTPS in front of this (nginx, Apache, Traefik...)?${C_RESET}"
+  say "  ${C_DIM}If yes, enter the public address it uses, for example https://ha.example.com. I will not touch that server;${C_RESET}"
+  say "  ${C_DIM}the summary at the end shows what to add to it. If no, press Enter and use an SSH tunnel.${C_RESET}"
+  while true; do
+    v="$(ask "Public https:// address of that web server (Enter for none)" "$cur")"
+    v="${v%/}"
+    if [[ -z "$v" ]]; then CFG[GATEKEEPER_PUBLIC_URL]=""; return 0; fi
+    if [[ "$v" == https://* ]] && is_safe_url "$v" && [[ "$(url_authority "$v")" == "${v#https://}" ]]; then
+      CFG[GATEKEEPER_PUBLIC_URL]="$v"
+      return 0
+    fi
+    warn "Please enter an address like https://ha.example.com (https only, no path)."
   done
 }
 
@@ -2621,6 +3419,10 @@ wizard_home_assistant() {
     fi
     first=false
 
+    if ! have curl; then
+      warn "Not testing the Home Assistant connection: curl is not installed (dry run). The final check tests it."
+      break
+    fi
     info "Testing the connection to Home Assistant..."
     if ha_probe "$url" "$token" "$cacert"; then
       ok "Home Assistant ${HA_VERSION:-?}${HA_LOCATION:+ (\"$HA_LOCATION\")} is reachable and the token works"
@@ -2735,7 +3537,12 @@ mode_description() {
   case "${CFG[GATEKEEPER_MODE]}" in
     domain) printf 'HTTPS with a Let'"'"'s Encrypt certificate at https://%s' "${CFG[GATEKEEPER_DOMAIN]}" ;;
     selfsigned) printf 'HTTPS on the IP address %s (self-signed certificate)' "${CFG[GATEKEEPER_DOMAIN]}" ;;
-    *) printf 'private: only on this server (127.0.0.1:%s), reached through an SSH tunnel' "${CFG[GATEKEEPER_PORT]}" ;;
+    *)
+      if [[ "${CFG[GATEKEEPER_PUBLIC_URL]:-}" == https://* ]]; then
+        printf 'private on this server (127.0.0.1:%s); your own web server serves it at %s' "${CFG[GATEKEEPER_PORT]}" "${CFG[GATEKEEPER_PUBLIC_URL]}"
+      else
+        printf 'private: only on this server (127.0.0.1:%s), reached through an SSH tunnel' "${CFG[GATEKEEPER_PORT]}"
+      fi ;;
   esac
 }
 
@@ -2768,6 +3575,7 @@ run_wizard() {
   case "${CFG[GATEKEEPER_MODE]}" in
     domain) wizard_domain ;;
     selfsigned) wizard_selfsigned ;;
+    local) wizard_behind_proxy ;;
   esac
   wizard_home_assistant
   wizard_admin_password
@@ -2777,8 +3585,6 @@ run_wizard() {
   ensure_secrets
   derive_config
   show_settings
-  say ""
-  confirm "Install with these settings?" y || die "Cancelled. Nothing was changed."
 }
 
 # Non-interactive: everything comes from --config, environment variables, the existing .env and defaults.
@@ -2788,7 +3594,7 @@ noninteractive_config() {
     if is_domain "${CFG[GATEKEEPER_DOMAIN]:-}"; then CFG[GATEKEEPER_MODE]=domain; else CFG[GATEKEEPER_MODE]=local; fi
   fi
   if [[ "${CFG[GATEKEEPER_MODE]}" == selfsigned && -z "${CFG[GATEKEEPER_DOMAIN]:-}" ]]; then
-    PUBLIC_IPV4="$(public_ip 4 || true)"
+    have curl && PUBLIC_IPV4="$(public_ip 4 || true)" || PUBLIC_IPV4=""
     CFG[GATEKEEPER_DOMAIN]="$PUBLIC_IPV4"
   fi
   if [[ -n "${CFG[HA_BASE_URL]:-}" ]]; then
@@ -2814,6 +3620,8 @@ noninteractive_config() {
 
   if [[ -n "${GK_SKIP_HA_CHECK:-}" ]]; then
     warn "Skipping the Home Assistant connection test (GK_SKIP_HA_CHECK is set)."
+  elif ! have curl; then
+    warn "Not testing the Home Assistant connection: curl is not installed (dry run). The final check tests it."
   elif ha_probe "$(ha_url_for_host_test "${CFG[HA_BASE_URL]}")" "${CFG[HA_TOKEN]}" "$(ha_ca_hostfile)"; then
     ok "Home Assistant ${HA_VERSION:-?}${HA_LOCATION:+ (\"$HA_LOCATION\")} is reachable and the token works"
   else
@@ -2821,7 +3629,7 @@ noninteractive_config() {
     die "Cannot continue without a working Home Assistant connection. (Set GK_SKIP_HA_CHECK=1 to override.)"
   fi
 
-  if [[ "${CFG[GATEKEEPER_MODE]}" == domain ]]; then dns_check "${CFG[GATEKEEPER_DOMAIN]}"; fi
+  if [[ "${CFG[GATEKEEPER_MODE]}" == domain ]] && have curl; then dns_check "${CFG[GATEKEEPER_DOMAIN]}"; fi
 }
 
 configure() {
@@ -2864,18 +3672,20 @@ configure() {
 # -------------------------------------------------------------------------------------------------
 
 apply_and_start() {
-  pick_app_port
-  check_web_ports || die "Cannot start the HTTPS proxy while those ports are taken."
   write_env_file
-  chmod 700 "$STATE_DIR" 2>/dev/null || true
-  mkdir -p "$APP_DIR/backups" "$APP_DIR/deploy/certs" "$APP_DIR/deploy/caddy"
+  fail_point after-env
+  jx_mkdir "$APP_DIR/backups" tree
   chmod 700 "$APP_DIR/backups"
+  jx_mkdir "$APP_DIR/deploy/certs"
+  jx_mkdir "$APP_DIR/deploy/caddy"
   fix_data_permissions
-  ok "Settings saved to $APP_DIR/.env (private, mode 600)"
+  sync_secret_files || die "Could not write the secret files."
+  ok "Settings saved to $APP_DIR/.env (private, mode 600); secrets are mounted as files, not environment variables"
 
   prepull_images || die "Could not download the required container images."
   write_caddyfile || die "Could not create a valid Caddy configuration."
   compose_build || die "The image build failed. Full log: $LOG_FILE"
+  fail_point after-build
 
   pause_watchdog_for_maintenance
   start_stack || die "The Gatekeeper container did not become healthy. Full log: $LOG_FILE"
@@ -2939,11 +3749,24 @@ print_summary() { # print_summary [failed]
 
   case "${CFG[GATEKEEPER_MODE]}" in
     local)
-      ip="$(public_ip 4 || echo '<server-ip>')"
-      say ""
-      say "  Private mode: nothing is exposed. From your own computer run:"
-      say "      ${C_BOLD}ssh -L ${CFG[GATEKEEPER_PORT]}:127.0.0.1:${CFG[GATEKEEPER_PORT]} root@${ip}${C_RESET}"
-      say "  and open http://localhost:${CFG[GATEKEEPER_PORT]}  ${C_DIM}(Chrome, Firefox or Edge; Safari refuses secure cookies on plain-HTTP localhost)${C_RESET}"
+      if [[ "$url" == https://* ]]; then
+        say ""
+        say "  Gatekeeper listens only on 127.0.0.1:${CFG[GATEKEEPER_PORT]}. Your own web server serves HTTPS at $url."
+        say "  This installer does not touch that server. If it does not forward yet, add this to its site (nginx example):"
+        say "      ${C_BOLD}location / {${C_RESET}"
+        say "      ${C_BOLD}    proxy_pass http://127.0.0.1:${CFG[GATEKEEPER_PORT]};${C_RESET}"
+        say "      ${C_BOLD}    proxy_set_header Host \$host;${C_RESET}"
+        say "      ${C_BOLD}    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;${C_RESET}"
+        say "      ${C_BOLD}    proxy_set_header X-Forwarded-Proto \$scheme;${C_RESET}"
+        say "      ${C_BOLD}}${C_RESET}"
+        say "  ${C_DIM}then reload it (nginx -t && systemctl reload nginx) and run: gatekeeper verify${C_RESET}"
+      else
+        ip="$(public_ip 4 || echo '<server-ip>')"
+        say ""
+        say "  Private mode: nothing is exposed. From your own computer run:"
+        say "      ${C_BOLD}ssh -L ${CFG[GATEKEEPER_PORT]}:127.0.0.1:${CFG[GATEKEEPER_PORT]} root@${ip}${C_RESET}"
+        say "  and open http://localhost:${CFG[GATEKEEPER_PORT]}  ${C_DIM}(Chrome, Firefox or Edge; Safari refuses secure cookies on plain-HTTP localhost)${C_RESET}"
+      fi
       ;;
     selfsigned)
       say ""
@@ -2974,42 +3797,324 @@ print_summary() { # print_summary [failed]
   warn "Copy $APP_DIR/.env to a safe place. It holds API_KEY_HASH_SECRET: without it every issued token stops working."
 }
 
+# -------------------------------------------------------------------------------------------------
+# The plan: everything that will change, shown and approved BEFORE anything is changed
+# -------------------------------------------------------------------------------------------------
+
+# Test hook: GK_FAIL_AT=<point> makes the install fail on purpose at that point (to prove rollback).
+fail_point() {
+  if [[ "${GK_FAIL_AT:-}" == "$1" ]]; then
+    die "Test hook GK_FAIL_AT=$1: stopping here on purpose."
+  fi
+  return 0
+}
+
+# A container named like ours that belongs to something else must never be replaced.
+check_container_conflicts() {
+  docker_up || return 0
+  local name wd
+  for name in "$GK_CONTAINER" "$CADDY_CONTAINER"; do
+    docker inspect --type container "$name" >/dev/null 2>&1 || continue
+    wd="$(docker inspect --type container -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name" 2>/dev/null || true)"
+    if [[ "$wd" != "$APP_DIR" ]]; then
+      die "A container named '$name' already exists and does not belong to $APP_DIR (${wd:+it was started from $wd}${wd:-it was not started by this installer}). This installer will not touch it. Nothing was changed."
+    fi
+    STACK_PRE=1
+  done
+  return 0
+}
+
+# Read-only analysis (plus the few questions that decide what the plan contains).
+decide_changes() {
+  STACK_PRE=0
+  compute_missing_prereqs
+  docker_plan
+  decide_docker_start
+  swap_plan
+  ufw_decide
+  check_container_conflicts
+  pick_app_port
+  check_web_ports || die "Nothing was changed."
+}
+
+PLAN_SOFTWARE=(); PLAN_SYSTEM=(); PLAN_NETWORK=(); PLAN_APPDIR=(); PLAN_KEEP=()
+
+build_plan() {
+  PLAN_SOFTWARE=(); PLAN_SYSTEM=(); PLAN_NETWORK=(); PLAN_APPDIR=(); PLAN_KEEP=()
+  local mode="${CFG[GATEKEEPER_MODE]}" hp owner p units fw_active=false
+
+  # --- software
+  if (( ${#P_PKGS[@]} > 0 )); then
+    PLAN_SOFTWARE+=("Install ${#P_PKGS[@]} small system package(s) with ${PKG}: ${P_PKGS[*]}")
+  else
+    PLAN_KEEP+=("The tools the installer needs (curl, git, jq, openssl...) are already installed: no packages are added")
+  fi
+  case "$P_DOCKER" in
+    install) PLAN_SOFTWARE+=("Install Docker Engine with Docker's official script (get.docker.com): adds Docker's package repository, installs docker-ce, containerd and the Compose plugin, enables Docker at boot and starts it") ;;
+    start)   PLAN_SOFTWARE+=("START the Docker service. It is installed but stopped, and starting it also starts every other container on this server that has a restart policy") ;;
+    ok)      PLAN_KEEP+=("Docker ($(docker --version 2>/dev/null | head -n 1)) is already installed and running: it is not reinstalled, upgraded or restarted") ;;
+  esac
+  if [[ "$P_DOCKER" != install ]] && $P_COMPOSE_NEEDED; then
+    PLAN_SOFTWARE+=("Install the Docker Compose plugin (your distribution's package, or a download from github.com/docker/compose into /usr/local/lib/docker/cli-plugins)")
+  fi
+
+  # --- system
+  if [[ "$P_DOCKER" != install ]] && $P_DOCKER_BOOT; then
+    PLAN_SYSTEM+=("Enable the Docker service at boot (it is installed but not set to start at boot; needed to come back after a reboot)")
+  fi
+  if (( P_SWAP_MB > 0 )); then
+    PLAN_SYSTEM+=("Create a ${P_SWAP_MB} MB swap file at $SWAP_FILE and add one line to $FSTAB_FILE (this server has little memory and the image build can run out of it)")
+  fi
+  PLAN_SYSTEM+=("Create the folder $STATE_DIR (the watchdog's heartbeat and pause flag)")
+  if have_systemd; then
+    PLAN_SYSTEM+=("Create or refresh 5 systemd units in $SYSTEMD_DIR (ha-gatekeeper.service, ha-gatekeeper-watchdog.service/.timer, ha-gatekeeper-backup.service/.timer) and enable them: start at boot, watchdog every minute, daily backup")
+  else
+    PLAN_SYSTEM+=("Create the cron file $CRON_FILE (watchdog every minute, start at boot, daily backup); there is no systemd here")
+  fi
+  PLAN_SYSTEM+=("Create the command $BIN_LINK (a link to $APP_DIR/install.sh)")
+  PLAN_SYSTEM+=("Write this run's log to $REAL_LOG_FILE; the watchdog logs to $WATCHDOG_LOG")
+  if [[ "$P_DOCKER" == install && "$PKG" == apt ]]; then
+    PLAN_SYSTEM+=("Temporarily write $APT_LOCK_CONF while Docker installs (so apt waits for locks); it is removed right after")
+  fi
+
+  # --- network and firewall
+  if [[ "$mode" == local ]]; then
+    PLAN_NETWORK+=("Open no ports. Gatekeeper listens on 127.0.0.1:${CFG[GATEKEEPER_PORT]} only, reachable from this server itself")
+  else
+    PLAN_NETWORK+=("Run the HTTPS proxy (Caddy container) that publishes ports 80 and 443 on all addresses of this server; Gatekeeper itself stays on 127.0.0.1:${CFG[GATEKEEPER_PORT]}")
+  fi
+  hp="$(ha_local_port || true)"
+  if [[ "${GATEKEEPER_UFW:-}" == 0 ]]; then
+    PLAN_NETWORK+=("Firewall: not touched (GATEKEEPER_UFW=0). Rules you may need are printed at the end instead")
+  else
+    ufw_active && fw_active=true
+    firewalld_active && fw_active=true
+    if $P_UFW_ENABLE; then
+      PLAN_NETWORK+=("TURN ON the ufw firewall (it is off now): allow SSH (port ${P_UFW_SSH_PORTS}), 80/tcp, 443/tcp, 443/udp and block all other incoming connections. Other services on this server would stop being reachable")
+    elif $fw_active; then
+      [[ "$mode" == local ]] || PLAN_NETWORK+=("Firewall (already active): add 80/tcp, 443/tcp, 443/udp where missing. None of your existing rules is changed or removed")
+    elif [[ "$mode" != local ]]; then
+      PLAN_NETWORK+=("Firewall: none is active, so nothing is changed. If your provider has its own firewall, allow TCP 80 and 443 there")
+    fi
+    if [[ -n "$hp" ]] && { $fw_active || $P_UFW_ENABLE; }; then
+      PLAN_NETWORK+=("Firewall: let the Docker networks (172.16.0.0/12) reach TCP port $hp, because Home Assistant runs on this server")
+    fi
+  fi
+  PLAN_NETWORK+=("Contact Home Assistant at ${CFG[HA_BASE_URL]} (its token is stored on this server only)")
+
+  # --- inside the app folder
+  units="$APP_DIR"
+  PLAN_APPDIR+=("$units/.env: your settings and secrets (mode 600; the previous one is kept as .env.previous)")
+  PLAN_APPDIR+=("$units/secrets/: one root-only file per secret, mounted read-only into the container (secrets never appear in 'docker inspect')")
+  PLAN_APPDIR+=("$units/data/ (database), $units/backups/ (daily backups)")
+  proxy_enabled && PLAN_APPDIR+=("$units/deploy/caddy/Caddyfile (generated)")
+  [[ -z "${CFG[HA_CA_CERT]:-}" ]] || PLAN_APPDIR+=("$units/deploy/certs/ha-ca.pem (the CA you provided for Home Assistant)")
+  if (( STACK_PRE == 1 )); then
+    PLAN_APPDIR+=("Rebuild the Docker image ha-gatekeeper:local if needed and re-create the containers of the existing installation with these settings")
+  else
+    PLAN_APPDIR+=("Build the Docker image ha-gatekeeper:local, download the base images it needs (if you do not have them) and start the container(s): $GK_CONTAINER$(proxy_enabled && printf ', %s' "$CADDY_CONTAINER")")
+  fi
+
+  # --- what is explicitly left alone
+  PLAN_KEEP+=("Your other Docker containers, images, volumes and networks; SSH settings; every existing firewall rule")
+  for p in 80 443; do
+    if port_in_use "$p" && ! stack_publishes_port "$p"; then
+      owner="$(port_owner "$p" || true)"
+      PLAN_KEEP+=("Port $p is used by ${owner:-another program}: it is not stopped, changed or reconfigured")
+    fi
+  done
+  if [[ -x /usr/sbin/nginx || -x /usr/sbin/apache2 || -x /usr/sbin/httpd ]]; then
+    PLAN_KEEP+=("Your web server (nginx/Apache) configuration is never read or modified")
+  fi
+}
+
+print_plan() {
+  local line
+  banner "Exactly what I am about to change on this server"
+  say "  ${C_BOLD}Nothing has been changed yet.${C_RESET} If you say yes, this is the complete list. Each change is recorded,"
+  say "  and if anything fails (an error, Ctrl-C, or the final health check) everything below is undone again,"
+  say "  newest first. Things that were already on this server are never removed."
+  say ""
+  if (( ${#PLAN_SOFTWARE[@]} > 0 )); then
+    say "${C_BOLD}Software${C_RESET}"
+    for line in "${PLAN_SOFTWARE[@]}"; do say "   * $line"; done
+    say ""
+  fi
+  say "${C_BOLD}System (outside $APP_DIR)${C_RESET}"
+  for line in "${PLAN_SYSTEM[@]}"; do say "   * $line"; done
+  say ""
+  say "${C_BOLD}Network and firewall${C_RESET}"
+  for line in "${PLAN_NETWORK[@]}"; do say "   * $line"; done
+  say ""
+  say "${C_BOLD}Inside the app folder${C_RESET}"
+  for line in "${PLAN_APPDIR[@]}"; do say "   * $line"; done
+  say ""
+  say "${C_BOLD}Left untouched${C_RESET}"
+  for line in "${PLAN_KEEP[@]}"; do say "   * $line"; done
+  say ""
+}
+
+# One decision for the whole list. Default is NO. --yes approves it for unattended runs.
+confirm_plan() {
+  if $DRY_RUN; then
+    say "${C_BOLD}Dry run:${C_RESET} nothing was changed. Run the same command without --dry-run to apply the list above."
+    journal_rollback quiet || true
+    INSTALL_ACTIVE=false
+    DISCARD_LOG=true
+    exit 0
+  fi
+  if $ASSUME_YES; then
+    say "--yes was given: continuing with exactly this list."
+    return 0
+  fi
+  if ! interactive; then
+    journal_rollback quiet || true
+    INSTALL_ACTIVE=false
+    DISCARD_LOG=true
+    err "There is no terminal to ask on, so I cannot get your approval. Nothing was changed."
+    hint "Run it interactively, or add --yes to approve this list unattended (add --dry-run first to just see it)."
+    exit 1
+  fi
+  if ! confirm "Make exactly these changes?" n; then
+    journal_rollback quiet || true
+    INSTALL_ACTIVE=false
+    DISCARD_LOG=true
+    say "Cancelled. Nothing was changed."
+    exit 1
+  fi
+}
+
+# The list was approved: the real log starts and the journal gets its on-disk copy.
+approve_plan() {
+  adopt_real_log
+  log_file "PLAN APPROVED"
+  ensure_state_dir
+  JOURNAL_LOG="$STATE_DIR/install-journal.log"
+  ( umask 077; : >>"$JOURNAL_LOG" ) 2>/dev/null || JOURNAL_LOG=""
+}
+
+# --- end of run
+
+commit_install() {
+  INSTALL_ACTIVE=false
+  if [[ -d "$STATE_DIR" ]]; then
+    { printf 'Changes made by the install on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; journal_list; printf -- '--- left in place by uninstall:\n'; journal_list keep-only; } \
+      >"$STATE_DIR/changes.txt" 2>/dev/null || true
+    chmod 600 "$STATE_DIR/changes.txt" 2>/dev/null || true
+  fi
+}
+
+print_changes_summary() {
+  local line n=0
+  banner "What this installation changed on your server"
+  say "  Outside $APP_DIR:"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    say "   * $line"
+    n=$((n + 1))
+  done < <(journal_list)
+  (( n > 0 )) || say "   * nothing: everything needed was already in place"
+  say "  Inside $APP_DIR: .env, secrets/, data/, backups/, the generated configuration, and the Docker image and containers."
+  say ""
+  say "  ${C_BOLD}Undo it:${C_RESET}  sudo gatekeeper uninstall"
+  say "  uninstall removes: the containers, the systemd units (or cron file), the 'gatekeeper' command, the firewall rules"
+  say "  named 'HA Gatekeeper ...', and the secrets/ folder. With your OK (or --purge) it also deletes the built image,"
+  say "  the saved HTTPS certificates, the data and .env."
+  say "  uninstall does ${C_BOLD}NOT${C_RESET} undo these (they may be useful to other things on the server):"
+  local kept=false
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    say "   * $line"
+    kept=true
+  done < <(journal_list keep-only)
+  say "   * base Docker images that were downloaded, and Docker's build cache (docker image prune / docker builder prune)"
+  say "   * the code in $APP_DIR, the backups in $APP_DIR/backups and the log $REAL_LOG_FILE"
+  $kept || true
+}
+
 cmd_install() {
+  INSTALL_ACTIVE=true
   banner "HA Gatekeeper installer  v$GK_VERSION"
   say "  Sets up HA Gatekeeper in Docker on this server: guided settings, HTTPS, automatic restarts,"
   say "  a watchdog, backups, and a full health check at the end. Safe to re-run at any time."
-  say "  Log: $LOG_FILE"
+  say "  ${C_BOLD}Nothing is changed until you have seen the complete list of changes and said yes.${C_RESET}"
+  $DRY_RUN && say "  ${C_YELLOW}Dry run: I will show the list and stop.${C_RESET}"
+  journal_tmp >/dev/null
 
-  step 1 6 "Checking this server"
-  ensure_prereqs
+  step 1 7 "Checking this server (read-only)"
   check_resources
-  check_internet
-  ensure_swap
+  if have curl; then check_internet; else warn "curl is not installed yet, so the internet check is skipped for now."; fi
 
-  step 2 6 "Docker"
-  ensure_docker
-
-  step 3 6 "Configuration"
+  step 2 7 "Your settings"
+  if ! have curl; then
+    local first_tools=(curl)
+    [[ -e /etc/ssl/certs/ca-certificates.crt || -d /etc/pki/tls/certs || -e /etc/ssl/cert.pem ]] || first_tools+=(ca-certificates)
+    consent_install_tools "Testing your Home Assistant connection needs curl." "${first_tools[@]}" || true
+  fi
   configure
+  decide_changes
+  fail_point after-config
 
-  step 4 6 "Building and starting"
+  step 3 7 "The complete list of changes"
+  build_plan
+  print_plan
+  confirm_plan
+  approve_plan
+
+  step 4 7 "Preparing the server"
+  ensure_prereqs
+  fail_point after-prereqs
+  create_swap
+  fail_point after-swap
+  ensure_docker
+  fail_point after-docker
+
+  step 5 7 "Building and starting"
   apply_and_start
+  fail_point after-start
 
-  step 5 6 "Automatic restarts, watchdog and firewall"
+  step 6 7 "Automatic restarts, watchdog and firewall"
   install_automation
   if [[ "${CFG[GATEKEEPER_MODE]}" == local ]]; then remove_firewall_rules; fi
   open_firewall
   cmd_backup || warn "The first backup did not complete; run: gatekeeper backup"
+  fail_point after-automation
 
-  step 6 6 "Verifying everything"
+  step 7 7 "Verifying everything"
   JUST_INSTALLED=true
+  fail_point before-verify
   local drill=""
   should_drill && drill=with-drill
   local verified=true
   verify_all "$drill" || verified=false
 
-  if $verified; then print_summary; else print_summary failed; fi
-  $verified || { warn "Some checks failed (see above). Fix them and run:  gatekeeper verify"; exit 1; }
+  if $verified; then
+    commit_install
+    print_summary
+    print_changes_summary
+    return 0
+  fi
+
+  # Failures that only mean "not ready yet" (a certificate still being issued) do not undo the install.
+  if (( V_FAIL > 0 && V_FAIL == V_FAIL_DEFERRED )); then
+    commit_install
+    print_summary failed
+    print_changes_summary
+    warn "The only open item is the HTTPS certificate, which Caddy keeps requesting by itself. Check again later:  gatekeeper verify"
+    exit 1
+  fi
+
+  if $KEEP_ON_FAILURE; then
+    INSTALL_ACTIVE=false
+    print_summary failed
+    warn "Some checks failed (see above). The installation was kept because --keep-on-failure is set. Fix them and run:  gatekeeper verify"
+    exit 1
+  fi
+  err "The final health check failed, so this installation is being undone (use --keep-on-failure to keep a failed install for debugging)."
+  journal_rollback || true
+  INSTALL_ACTIVE=false
+  hint "Fix the problem listed above and run the installer again. Install log: $REAL_LOG_FILE"
+  exit 1
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -3023,19 +4128,25 @@ load_runtime_config() {
   derive_config
 }
 
-require_docker() {
+require_docker() { # require_docker [start]
   have docker || die "Docker is not installed. Run: sudo $APP_DIR/install.sh"
   DOCKER_BIN="$(command -v docker)"
-  start_docker
+  docker_up && return 0
+  if [[ "${1:-}" == start ]]; then
+    start_docker
+    return 0
+  fi
+  die "Docker is not running. Start it with  systemctl start docker  (that also starts your other containers), then try again."
 }
 
 cmd_verify() {
   load_runtime_config
-  require_docker
+  have docker && DOCKER_BIN="$(command -v docker)"
   banner "HA Gatekeeper health check"
-  local drill=""
+  local drill="" rc=0
   [[ "$DRILL" == yes ]] && drill=with-drill
-  verify_all "$drill"
+  verify_all "$drill" || rc=1
+  exit "$rc"
 }
 
 human_age() { # human_age SECONDS
@@ -3049,10 +4160,11 @@ human_age() { # human_age SECONDS
 
 cmd_status() {
   load_runtime_config
-  require_docker
+  have docker && DOCKER_BIN="$(command -v docker)"
   local name state health since hb newest
   banner "HA Gatekeeper status"
   say "  URL            : ${CFG[GATEKEEPER_PUBLIC_URL]}   (${CFG[GATEKEEPER_MODE]})"
+  docker_up || say "  Docker         : ${C_RED}not running${C_RESET}"
   if [[ -d "$APP_DIR/.git" ]]; then
     say "  Version        : $(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null) on $(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)"
   fi
@@ -3084,6 +4196,12 @@ cmd_status() {
   say "  ${C_DIM}Run 'gatekeeper verify' for a full check.${C_RESET}"
 }
 
+cmd_secrets() {
+  load_runtime_config
+  sync_secret_files || die "Could not write the secret files."
+  ok "Secret files in $APP_DIR/secrets are up to date with .env"
+}
+
 cmd_logs() {
   load_runtime_config
   require_docker
@@ -3101,8 +4219,9 @@ cmd_logs() {
 
 cmd_start() {
   load_runtime_config
-  require_docker
+  require_docker start
   resume_watchdog
+  sync_secret_files || die "Could not write the secret files."
   run_logged "Starting the containers" dc up -d --remove-orphans || die "Could not start the containers."
   if wait_for_container "$GK_CONTAINER" 120; then
     ok "Gatekeeper is running and healthy"
@@ -3208,6 +4327,7 @@ cmd_restore() {
     fi
   fi
   fix_data_permissions
+  sync_secret_files || die "Could not write the secret files."
   run_logged "Starting the containers" dc up -d --remove-orphans || die "Could not start the containers."
   wait_for_container "$GK_CONTAINER" 120 || die "Gatekeeper did not become healthy after the restore: gatekeeper logs"
   resume_watchdog
@@ -3338,7 +4458,7 @@ cmd_uninstall() {
   rm -f "$CRON_FILE"
   [[ -L "$BIN_LINK" ]] && rm -f "$BIN_LINK"
 
-  if have docker && docker_ready; then
+  if have docker && docker_up; then
     ( cd "$APP_DIR" && docker compose --profile proxy down --remove-orphans ) >>"$LOG_FILE" 2>&1 || true
     ok "Stopped and removed the containers"
     if confirm_purge "Also delete the built images?" n; then
@@ -3357,9 +4477,24 @@ cmd_uninstall() {
     rm -f "$APP_DIR/.env" "$APP_DIR/.env.previous"
   fi
   rm -f "$APP_DIR/gatekeeper-root-ca.crt"
+  rm -rf "$APP_DIR/secrets"
   remove_firewall_rules
+  local left=""
+  if [[ -r "$STATE_DIR/changes.txt" ]]; then
+    left="$(sed -n '/^--- left in place by uninstall:$/,$p' "$STATE_DIR/changes.txt" | sed '1d')"
+  fi
   rm -rf "$STATE_DIR"
   ok "HA Gatekeeper is uninstalled. The code in $APP_DIR and the backups were left in place."
+  say ""
+  say "${C_BOLD}Not undone by uninstall${C_RESET} (installed or changed by the installer, possibly useful to other things here):"
+  if [[ -n "$left" ]]; then
+    while IFS= read -r line; do [[ -n "$line" ]] && say "   * $line"; done <<<"$left"
+  else
+    say "   * (nothing recorded: Docker and packages were already on this server, or were installed by an older installer)"
+  fi
+  say "   * base Docker images and Docker's build cache (docker image prune, docker builder prune)"
+  say "   * the code and backups in $APP_DIR, and the log $REAL_LOG_FILE"
+  say "   * a firewall (ufw) that was switched on, and its SSH rule: they keep protecting this server"
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -3385,9 +4520,12 @@ Commands
   help
 
 Options
-  -y, --yes, --non-interactive   Never ask; use the environment, --config and the existing .env.
+  -y, --yes, --non-interactive   Never ask; use the environment, --config and the existing .env. This also
+                                 approves the list of changes shown by the installer.
   --config FILE                  Read answers from FILE (same KEY="value" format as .env).
   --reconfigure                  Ask everything again even if settings already exist.
+  --dry-run                      (install) show the complete list of changes and stop; nothing is changed.
+  --keep-on-failure              (install) do not undo a failed installation (for debugging).
   --quick                        (verify) skip the temporary-token write test.
   --drill / --no-drill           Force / skip the crash-recovery drill.
   --with-env                     (restore) also restore the saved .env without asking.
@@ -3401,6 +4539,12 @@ Answers for non-interactive use can be given as environment variables (use sudo 
   HA_BASE_URL  HA_TOKEN  ADMIN_PASSWORD  GATEKEEPER_MODE (domain|selfsigned|local)
   GATEKEEPER_DOMAIN  ACME_EMAIL  ALERT_WEBHOOK_URL  ADMIN_ALLOWED_IPS  AUDIT_LOG_RETENTION_DAYS
   HA_CA_FILE (host path to the CA file for a private Home Assistant certificate)
+  GATEKEEPER_PUBLIC_URL (private mode behind your own HTTPS web server, e.g. https://ha.example.com)
+Safety switches (environment):
+  GATEKEEPER_UFW=1|0           1: switch ufw on (SSH, 80, 443) without asking. 0: never touch the firewall.
+  GATEKEEPER_SWAP=1|0          1: add a swap file on a small server without asking. 0: never.
+  GATEKEEPER_START_DOCKER=1    allow starting a Docker service that is installed but stopped (unattended).
+  GATEKEEPER_KEEP_ON_FAILURE=1 same as --keep-on-failure.
 See deploy/env.example and docs/DEPLOY_VPS.md.
 EOF
 }
@@ -3414,6 +4558,8 @@ parse_args() {
       -h|--help) COMMAND=help ;;
       -y|--yes|--non-interactive) NON_INTERACTIVE=true; ASSUME_YES=true ;;
       --purge) PURGE=true ;;
+      --dry-run) DRY_RUN=true ;;
+      --keep-on-failure) KEEP_ON_FAILURE=true ;;
       --config) [[ $# -gt 0 ]] || die "--config needs a file"; CONFIG_FILE="$1"; shift ;;
       --config=*) CONFIG_FILE="${arg#--config=}" ;;
       --reconfigure) RECONFIGURE=true ;;
@@ -3424,7 +4570,7 @@ parse_args() {
       --quiet) QUIET=true ;;
       -v|--verbose) VERBOSE=true ;;
       --no-color) NO_COLOR_FLAG=true ;;
-      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|help)
+      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|help)
         if $have_command; then
           COMMAND_ARGS+=("$arg")
         else
@@ -3449,19 +4595,52 @@ ensure_root() {
   exit 1
 }
 
-init_logging() {
+open_real_log() {
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   if [[ -f "$LOG_FILE" && "$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)" -gt 2097152 ]]; then
     mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
   fi
-  ( umask 077; touch "$LOG_FILE" ) 2>/dev/null || LOG_FILE=""
+  ( umask 077; touch "$LOG_FILE" ) 2>/dev/null || LOG_FILE=/dev/null
+}
+
+init_logging() {
+  REAL_LOG_FILE="$LOG_FILE"
+  if [[ "$COMMAND" == install ]]; then
+    # Nothing is written to /var/log until the user has approved the plan (a declined run or a
+    # --dry-run leaves the server exactly as it was).
+    PENDING_LOG="$(mktemp "${TMPDIR:-/tmp}/gk-install-log.XXXXXX" 2>/dev/null || true)"
+    LOG_FILE="${PENDING_LOG:-/dev/null}"
+    chmod 600 "$LOG_FILE" 2>/dev/null || true
+  else
+    open_real_log
+  fi
   log_file "===== $COMMAND started (v$GK_VERSION) ====="
 }
 
+# The plan was approved: from now on the log lives in its real place.
+adopt_real_log() {
+  [[ -n "$PENDING_LOG" ]] || return 0
+  local pending="$PENDING_LOG"
+  PENDING_LOG=""
+  LOG_FILE="$REAL_LOG_FILE"
+  open_real_log
+  if [[ "$LOG_FILE" != /dev/null ]]; then cat "$pending" >>"$LOG_FILE" 2>/dev/null || true; fi
+  rm -f -- "$pending"
+}
+
 take_lock() {
-  mkdir -p "$STATE_DIR"
-  chmod 700 "$STATE_DIR"
-  exec 200>"$STATE_DIR/install.lock"
+  local lock="${GK_LOCK_FILE:-}" d
+  if [[ -z "$lock" && -z "${GK_STATE_DIR:-}" ]]; then
+    for d in /run/lock /var/lock /run; do
+      if [[ -d "$d" && -w "$d" ]]; then lock="$d/ha-gatekeeper-install.lock"; break; fi
+    done
+  fi
+  if [[ -z "$lock" ]]; then
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    lock="$STATE_DIR/install.lock"
+  fi
+  exec 200>"$lock"
   flock -n 200 || die "Another install/update/backup is already running. Wait for it to finish."
 }
 
@@ -3474,7 +4653,16 @@ bootstrap_repo() {
   [[ -z "${GK_BOOTSTRAPPED:-}" ]] || die "Bootstrap failed: $INSTALL_DIR does not look like an HA Gatekeeper checkout."
 
   info "No checkout next to this script: fetching HA Gatekeeper ($REPO_BRANCH) into $INSTALL_DIR"
-  have git || pkg_install git || die "git is required (apt-get install git) to fetch HA Gatekeeper."
+  local created_dir=false boot_pkgs=""
+  [[ -e "$INSTALL_DIR" ]] || created_dir=true
+  if ! have git; then
+    INSTALL_ACTIVE=true
+    consent_install_tools "Downloading HA Gatekeeper needs git." git || die "git is required (apt-get install git) to fetch HA Gatekeeper."
+    if (( ${#J_FN[@]} > 0 )) && [[ "${J_FN[0]}" == rv_pkgs_since ]]; then
+      boot_pkgs="${J_DESC[0]#Installed packages: }"
+      cp -- "$JOURNAL_TMP/pkgs.0" "$JOURNAL_TMP/pkgs.boot"
+    fi
+  fi
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     if ! { retry 3 5 git -C "$INSTALL_DIR" fetch --depth 1 origin "$REPO_BRANCH" </dev/null >>"$LOG_FILE" 2>&1 \
       && git -C "$INSTALL_DIR" checkout -q "$REPO_BRANCH" </dev/null >>"$LOG_FILE" 2>&1 \
@@ -3490,6 +4678,11 @@ bootstrap_repo() {
   fi
   ok "Fetched HA Gatekeeper into $INSTALL_DIR"
   export GK_BOOTSTRAPPED=1
+  # The new process starts with an empty journal: hand over what this one changed, so it can be undone.
+  export GK_BOOT_TMP="$JOURNAL_TMP"
+  [[ -z "$boot_pkgs" ]] || export GK_BOOT_PKGS="$boot_pkgs"
+  ! $created_dir || export GK_BOOT_CREATED_DIR="$INSTALL_DIR"
+  [[ -z "$PENDING_LOG" ]] || rm -f -- "$PENDING_LOG"
   exec bash "$INSTALL_DIR/install.sh" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
 }
 
@@ -3506,15 +4699,32 @@ main() {
     log_file "no terminal available: running non-interactively"
   fi
 
+  trap cleanup EXIT
+  trap 'on_error $? $LINENO' ERR
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  # Created here, in the main shell (a first call inside $(...) would be lost).
+  [[ "$COMMAND" == install ]] && journal_tmp >/dev/null
+
   bootstrap_repo
   # shellcheck source=deploy/lib.sh
   source "$APP_DIR/deploy/lib.sh"
 
-  trap cleanup EXIT
-  trap 'on_error $? $LINENO' ERR
+  # Re-entered after the download step above: pick up what that step changed so it can be undone too.
+  if [[ -n "${GK_BOOT_TMP:-}" && -d "${GK_BOOT_TMP:-}" ]]; then
+    TMP_FILES+=("$GK_BOOT_TMP")
+    if [[ -n "${GK_BOOT_PKGS:-}" ]]; then
+      J_KEEP_NEXT=1 jpush "Installed packages: $GK_BOOT_PKGS" rv_pkgs_since "$GK_BOOT_TMP/pkgs.boot"
+    fi
+  fi
+  if [[ -n "${GK_BOOT_CREATED_DIR:-}" ]]; then
+    jpush "Downloaded HA Gatekeeper into $GK_BOOT_CREATED_DIR" rv_rmtree "$GK_BOOT_CREATED_DIR"
+  fi
 
   case "$COMMAND" in
-    install|update|backup|restore|start|stop|restart|uninstall) take_lock ;;
+    install|update|backup|restore|start|stop|restart|uninstall|secrets) take_lock ;;
   esac
 
   case "$COMMAND" in
@@ -3529,6 +4739,7 @@ main() {
     backup)    cmd_backup ;;
     restore)   cmd_restore ;;
     uninstall) cmd_uninstall ;;
+    secrets)   cmd_secrets ;;
     *)         usage; exit 1 ;;
   esac
 }

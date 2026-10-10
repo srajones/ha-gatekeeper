@@ -24,3 +24,4 @@ backups
 deploy/caddy
 deploy/certs
 gatekeeper-root-ca.crt
+secrets
