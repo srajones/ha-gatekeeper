@@ -133,3 +133,23 @@ test("no token configured: it does not even try to connect", async () => {
   await sleep(200);
   assert.equal(server.connections, before);
 });
+
+test("switching the live subscription off and on quickly always ends in the state asked for last", async () => {
+  const hub = makeHub();
+  hub.start();
+  await until(() => hub.isConnected());
+
+  const stopped = hub.stop();
+  hub.start(); // changed our mind before the stop finished
+  await stopped;
+  await until(() => hub.isConnected(), 4000);
+  assert.equal(hub.status().running, true);
+
+  hub.start();
+  const off = hub.stop();
+  hub.start();
+  void hub.stop();
+  await off;
+  assert.equal(hub.status().running, false);
+  assert.equal(hub.isConnected(), false);
+});

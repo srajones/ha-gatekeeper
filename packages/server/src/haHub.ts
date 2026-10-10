@@ -112,6 +112,8 @@ export class HaStateHub {
   private subscribed = new Set<string>();
   private connected = false;
   private running = false;
+  private desired = false;
+  private reconciling: Promise<void> | null = null;
   private stopRequested = false;
   private resubscribeRequested = false;
   private wake: (() => void) | null = null;
@@ -191,28 +193,52 @@ export class HaStateHub {
   // ---- lifecycle -----------------------------------------------------------------------------
 
   // Starts the supervisor once. A second call (double import, reload) does nothing, so there is
-  // never more than one Home Assistant subscription in this process.
+  // never more than one Home Assistant subscription in this process. start() and stop() only state
+  // what is wanted; reconcile() makes it so, one transition at a time, so a quick off-then-on
+  // (the dashboard setting) always ends in the state asked for last.
   start(): void {
-    if (this.running) {
-      return;
-    }
-    this.running = true;
-    this.stopRequested = false;
-    this.loopDone = this.supervise();
+    this.desired = true;
+    void this.reconcile();
   }
 
   async stop(): Promise<void> {
-    this.stopRequested = true;
-    this.wakeUp();
-    try {
-      this.activeConnection?.close();
-    } catch {
-      // already closed
+    this.desired = false;
+    await this.reconcile();
+  }
+
+  private reconcile(): Promise<void> {
+    if (this.reconciling) {
+      // A pass is running: let it finish, then look again (what is wanted may have changed meanwhile).
+      return this.reconciling.then(() => this.reconcile());
     }
-    await this.loopDone;
-    this.loopDone = null;
-    this.running = false;
-    this.connected = false;
+    const pass = (async () => {
+      while (this.running !== this.desired) {
+        if (this.desired) {
+          this.stopRequested = false;
+          this.running = true;
+          this.loopDone = this.supervise();
+        } else {
+          this.stopRequested = true;
+          this.wakeUp();
+          try {
+            this.activeConnection?.close();
+          } catch {
+            // already closed
+          }
+          await this.loopDone;
+          this.loopDone = null;
+          this.running = false;
+          this.connected = false;
+        }
+      }
+    })();
+    this.reconciling = pass;
+    void pass.finally(() => {
+      if (this.reconciling === pass) {
+        this.reconciling = null;
+      }
+    });
+    return pass;
   }
 
   // The set of entities changed (a key was created, edited, disabled or deleted, or the Home
