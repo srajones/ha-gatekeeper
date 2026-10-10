@@ -4295,6 +4295,7 @@ cmd_backup() {
   cp -p "$APP_DIR/.env" "$tmp/dot-env"
   printf 'HA Gatekeeper backup\ncreated: %s\nmethod: %s\nversion: %s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$method" "$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)" >"$tmp/manifest.txt"
+  jpush "Created the backup $dest" rv_rm "$dest"
   tar -C "$tmp" -czf "$dest" ha-gatekeeper.db dot-env manifest.txt
   chmod 600 "$dest"
   rm -rf "$tmp"
