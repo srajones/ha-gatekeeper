@@ -514,7 +514,18 @@ rv_restore_env() { # rv_restore_env BACKUP STACK_PREEXISTING(0|1)
 # Undo everything recorded so far, newest first. Never aborts half-way.
 journal_rollback() { # journal_rollback [quiet]
   $ROLLING_BACK && return 0
-  (( ${#J_DESC[@]} > 0 )) || return 0
+  if (( ${#J_DESC[@]} == 0 )); then
+    # Nothing was changed yet: still say why the run stopped and that its log is kept.
+    if $INSTALL_ACTIVE && [[ "${1:-}" != quiet ]] && ! $DISCARD_LOG; then
+      log_file "ROLLBACK: nothing to undo${ROLLBACK_CAUSE:+ (cause: $ROLLBACK_CAUSE)}"
+      # a die() message already shown on screen is not repeated
+      if [[ -n "${ROLLBACK_CAUSE:-}" && "$ROLLBACK_CAUSE" != stopped:* ]]; then
+        printf '%sCause: %s%s\n' "$C_DIM" "$ROLLBACK_CAUSE" "$C_RESET"
+      fi
+      printf '%sNothing had been changed yet. Kept for you, on purpose: the install log %s (what happened and why).%s\n' "$C_DIM" "${REAL_LOG_FILE:-$LOG_FILE}" "$C_RESET"
+    fi
+    return 0
+  fi
   ROLLING_BACK=true
   trap - ERR
   local cause="${ROLLBACK_CAUSE:-}"
@@ -4214,6 +4225,7 @@ cmd_install() {
     exit 1
   fi
   err "The final health check failed, so this installation is being undone (use --keep-on-failure to keep a failed install for debugging)."
+  ROLLBACK_CAUSE="the final health check failed (${V_FAIL} problem(s); see the [FAIL] lines above)"
   journal_rollback || true
   INSTALL_ACTIVE=false
   hint "Fix the problem listed above and run the installer again. Install log: $REAL_LOG_FILE"

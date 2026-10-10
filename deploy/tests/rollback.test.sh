@@ -475,6 +475,30 @@ ck "cause printed" out_has "Cause: SIGHUP: the terminal or SSH session closed"
 ck "cause logged" grep -q "ROLLBACK started with 1 entries (cause: SIGHUP" "$T/install.log"
 ck "log kept note" out_has "Kept for you, on purpose: the install log"
 
+echo "a failure with nothing to undo still says why and that the log is kept"
+run_case emptycause '
+  INSTALL_ACTIVE=true
+  ROLLBACK_CAUSE="SIGHUP: the terminal or SSH session closed"
+  journal_rollback
+'
+ck "empty journal: cause printed" out_has "Cause: SIGHUP: the terminal or SSH session closed"
+ck "empty journal: log kept note" out_has "Kept for you, on purpose: the install log"
+ck "empty journal: cause logged" grep -q "ROLLBACK: nothing to undo (cause: SIGHUP" "$T/install.log"
+run_case emptydie '
+  INSTALL_ACTIVE=true
+  ROLLBACK_CAUSE="stopped: Port 80 is busy"
+  journal_rollback
+'
+ck "a die() cause is not repeated on screen" bash -c "! grep -q 'Cause:' '$CASE_OUT'"
+run_case emptydiscard '
+  INSTALL_ACTIVE=true; DISCARD_LOG=true
+  journal_rollback
+'
+ck "a declined run (log discarded) claims no kept log" bash -c "! grep -q 'Kept for you' '$CASE_OUT'"
+
+echo "a failed final health check names its cause"
+ck "the verify failure sets a rollback cause" grep -q 'ROLLBACK_CAUSE="the final health check failed' "$REPO/install.sh"
+
 # ================================================================== Docker Engine leftovers (O2)
 echo "undoing Docker Engine also removes what the packages leave behind, only if this run created it"
 cat >"$SHIM/getent" <<'EOF'
