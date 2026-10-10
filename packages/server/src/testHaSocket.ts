@@ -59,6 +59,7 @@ export class FakeHaServer {
   subscriptions: string[][] = [];
   silent = false; // ignore everything the client sends: no pong, no events
   rejectAuth = false;
+  refuse = false; // refuse new websocket connections (Home Assistant restarting)
   private nextClientId = 1;
 
   constructor(private readonly token: string, onRequest?: http.RequestListener) {
@@ -108,7 +109,7 @@ export class FakeHaServer {
 
   private upgrade(req: http.IncomingMessage, socket: Duplex): void {
     const key = req.headers["sec-websocket-key"];
-    if (req.url !== "/api/websocket" || typeof key !== "string") {
+    if (this.refuse || req.url !== "/api/websocket" || typeof key !== "string") {
       socket.destroy();
       return;
     }

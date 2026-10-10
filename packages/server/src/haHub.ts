@@ -445,11 +445,20 @@ export class HaStateHub {
       this.reconnects += 1;
       this.options.log?.info(`Subscribed to ${ids.length} Home Assistant entities over one websocket`);
 
+      // The silence window is `idleMs`, but the wait is cut into slices of at most one second so a
+      // resubscribe or stop request is noticed within a second instead of after a whole window.
+      const slice = Math.min(this.idleMs, 1000);
+      let silent = 0;
       let missed = 0;
       let messageId = 1;
       while (!this.resubscribeRequested && !this.stopRequested) {
-        const raw = await ws.recv(this.idleMs);
+        const raw = await ws.recv(slice);
         if (raw === RECV_TIMEOUT) {
+          silent += slice;
+          if (silent < this.idleMs) {
+            continue;
+          }
+          silent = 0;
           missed += 1;
           if (missed > this.maxMissed) {
             throw new Error("unresponsive");
@@ -458,6 +467,7 @@ export class HaStateHub {
           ws.send(JSON.stringify({ id: messageId, type: "ping" }));
           continue;
         }
+        silent = 0;
         missed = 0; // any frame at all proves the link is alive
         let frame: unknown;
         try {

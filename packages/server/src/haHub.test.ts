@@ -33,6 +33,7 @@ function makeHub(script: Step[], overrides: Partial<HubOptions> = {}) {
   const connection = new ScriptedConnection(script);
   const hub = new HaStateHub({
     baseUrl: "http://ha.local:8123",
+    idleMs: 1000, // one scripted timeout = one full silence window
     getToken: () => "token",
     collectEntityIds: () => ["light.a", "sensor.b"],
     connect: async () => connection,
