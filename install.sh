@@ -443,6 +443,14 @@ rv_docker_engine() { # rv_docker_engine PKG_SNAPSHOT FILES_BEFORE HAD_DOCKER_DIR
 
 rv_docker_logout() { have docker && docker logout >/dev/null 2>&1; return 0; }
 
+# The database file(s) the app created inside a data folder that already existed.
+rv_rm_db() { # rv_rm_db DATA_DIR
+  local d="$1" f
+  for f in ha-gatekeeper.db ha-gatekeeper.db-journal ha-gatekeeper.db-wal ha-gatekeeper.db-shm .backup-snapshot.db; do
+    rm -f -- "$d/$f"
+  done
+}
+
 rv_image_rm() {
   have docker && docker_ready || return 0
   local img rc=0
@@ -1885,6 +1893,7 @@ fix_data_permissions() {
   local data
   data="$(data_dir_abs)"
   jx_mkdir "$data" tree
+  [[ -e "$data/ha-gatekeeper.db" ]] || jpush "Created the database in $data (when the app first starts)" rv_rm_db "$data"
   if chown -R "$SERVICE_UID:$SERVICE_UID" "$data" 2>>"$LOG_FILE"; then
     chmod 750 "$data"
   else
