@@ -76,3 +76,15 @@ not a reason to restart this server.
 If the server itself loses power or network, nothing running on it can send a message. That is what `HEARTBEAT_URL` is
 for: an outside service that expects a ping every minute and alerts you when they stop. Use it; it is the one alert that
 survives the machine dying.
+
+## Proving it yourself
+
+`deploy/tests/chaos.sh` breaks an installed copy on purpose (process killed like an out-of-memory kill, restart, frozen
+process, deleted container, stopped container, a full data disk; optionally a Docker daemon restart) and checks each is
+healed without you, and how fast. Typical results on a small VPS: killed process back in about 6 s, deleted container
+back in under a minute, frozen process replaced in about 1.5 minutes, a full disk noticed and the app restarted in
+about 90 s. It undoes everything it does. Run it on a test copy first:
+`sudo bash deploy/tests/chaos.sh [--with-diskfull] [--with-docker-restart]`.
+
+Note: `docker kill` is not a crash. Docker treats it as you stopping the container and will not restart it; the
+watchdog does (within a minute or two). A process killed from outside, or by the kernel, is restarted by Docker itself.

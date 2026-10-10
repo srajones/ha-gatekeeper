@@ -3245,6 +3245,28 @@ verify_summary() {
   return 0
 }
 
+# Alerts are optional, so having none is a hint and not a failed or warned check (it must not make a healthy
+# server look unhealthy); channels that are set up but broken ARE a warning.
+verify_alerts() {
+  vsection "Alerts"
+  local on out line bad=0
+  on="$(alerts_configured_text)"
+  if [[ "$on" == none ]]; then
+    $QUIET || printf '  %s[ -- ]%s No alert channel is set up: nobody would be told if Home Assistant or this server goes down. Set one up with: sudo gatekeeper alerts\n' "$C_DIM" "$C_RESET"
+    log_file "INFO  no alert channel set up"
+    return 0
+  fi
+  out="$(alert_problems)"
+  if [[ -n "$out" ]]; then
+    while IFS= read -r line; do [[ -z "$line" ]] || vwarn "Alert settings: $line" "Fix it with: sudo gatekeeper alerts"; bad=1; done <<<"$out"
+  fi
+  (( bad )) || vpass "Alerts go to: $on (test them any time with: gatekeeper alerts test)"
+  if [[ -z "${CFG[HEARTBEAT_URL]:-}" ]]; then
+    $QUIET || printf '  %s[ -- ]%s Tip: a heartbeat URL (healthchecks.io, Uptime Kuma) is the only alert that survives this whole server dying: sudo gatekeeper alerts\n' "$C_DIM" "$C_RESET"
+  fi
+  return 0
+}
+
 verify_all() { # verify_all [with-drill]
   V_PASS=0; V_WARN=0; V_FAIL=0
   local drill="${1:-}"
@@ -3256,6 +3278,7 @@ verify_all() { # verify_all [with-drill]
   verify_app
   if proxy_enabled; then verify_public; else verify_behind_proxy; fi
   verify_automation
+  verify_alerts
   verify_data
   if [[ "$drill" == with-drill ]]; then run_drill; fi
   if [[ "${GK_FAIL_AT:-}" == verify ]]; then vfail "Forced failure (GK_FAIL_AT=verify, a test hook)"; fi

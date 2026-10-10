@@ -16,6 +16,7 @@ import { startGateway, stopGateway } from "./ha.js";
 import { startHaMonitor, stopHaMonitor } from "./haMonitor.js";
 import { setHubLogger } from "./hubRuntime.js";
 import { loadSettings } from "./settings.js";
+import { DatabaseHealth } from "./health.js";
 
 // Fastify 5 no longer takes a hop count directly; trust the first N addresses from the socket.
 const trustProxy =
@@ -72,9 +73,10 @@ if (fs.existsSync(webDist)) {
 }
 
 // Health for Docker and the watchdog. It must NOT depend on Home Assistant (a Home Assistant outage is not a
-// reason to restart this server) but it does check what this server cannot work without: its database.
+// reason to restart this server) but it does check what this server cannot work without: its database (see health.ts).
 app.get("/healthz", async (_request, reply) => {
-  if (await databaseResponds()) {
+  const db = await dbHealth.quick();
+  if (db.ok) {
     return { ok: true };
   }
   return reply.status(503).send({ ok: false, error: "database" });
@@ -112,30 +114,26 @@ async function pruneAuditLogs() {
   }
 }
 
-async function databaseResponds(): Promise<boolean> {
-  try {
-    await Promise.race([
-      prisma.$queryRaw`SELECT 1`,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("database timeout")), 3000).unref())
-    ]);
-    return true;
-  } catch {
-    return false;
-  }
-}
+const dbHealth = new DatabaseHealth({
+  read: () => prisma.setting.count(),
+  write: () =>
+    prisma.setting.upsert({
+      where: { key: "health.ping" },
+      create: { key: "health.ping", value: String(Date.now()) },
+      update: { value: String(Date.now()), updatedAt: new Date() }
+    })
+});
 
-// Self-healing: if the database stops answering for a minute and a half, exit so Docker (restart policy)
-// starts a fresh process right away, without waiting for the host watchdog. A crash anywhere else does the same.
-let dbFailures = 0;
+// Self-healing: if the database fails its read/write check three times in a row (about 90 s), exit so Docker
+// (restart policy) starts a fresh process right away, without waiting for the host watchdog.
 setInterval(async () => {
-  if (await databaseResponds()) {
-    dbFailures = 0;
+  const result = await dbHealth.full();
+  if (result.ok) {
     return;
   }
-  dbFailures += 1;
-  app.log.error({ dbFailures }, "database_not_responding");
-  if (dbFailures >= 3) {
-    app.log.fatal("database not responding for 90 s: exiting so Docker restarts the process");
+  app.log.error({ failures: dbHealth.consecutiveFailures, error: result.error }, "database_check_failed");
+  if (dbHealth.consecutiveFailures >= 3) {
+    app.log.fatal("database failing for about 90 s: exiting so Docker restarts the process");
     process.exit(1);
   }
 }, 30_000).unref();
