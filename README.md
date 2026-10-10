@@ -40,7 +40,7 @@ apt-get update && apt-get install -y git   # only needed on minimal Debian/Ubunt
 git clone https://github.com/srajones/ha-gatekeeper.git && cd ha-gatekeeper && sudo ./install.sh
 ```
 
-`install.sh` installs Docker if needed, asks for your Home Assistant URL/token and admin password (secrets are generated), sets up HTTPS with Caddy, starts everything with automatic restarts and a watchdog, and finishes with a full health check. Re-run it any time to repair; use `gatekeeper verify|status|logs|update|backup` afterwards. See [docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md).
+`install.sh` asks for your Home Assistant URL/token and admin password (secrets are generated), then shows **the complete list of everything it will change on the server and waits for your yes** (`--dry-run` shows the list and stops). After approval it installs Docker only if missing, sets up HTTPS with Caddy (or sits behind the web server you already run), starts everything with automatic restarts and a watchdog, and finishes with a full health check. If anything fails it undoes what it did. Secrets are mounted into the container as read-only files, never as environment variables. Re-run it any time to repair; use `gatekeeper verify|status|logs|update|backup` afterwards. See [docs/DEPLOY_VPS.md](docs/DEPLOY_VPS.md).
 
 ## Local Development
 

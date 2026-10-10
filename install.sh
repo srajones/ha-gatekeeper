@@ -3912,7 +3912,7 @@ build_plan() {
   if (( STACK_PRE == 1 )); then
     PLAN_APPDIR+=("Rebuild the Docker image ha-gatekeeper:local if needed and re-create the containers of the existing installation with these settings")
   else
-    PLAN_APPDIR+=("Build the Docker image ha-gatekeeper:local, download the base images it needs (if you do not have them) and start the container(s): $GK_CONTAINER$(proxy_enabled && printf ', %s' "$CADDY_CONTAINER")")
+    PLAN_APPDIR+=("Build the Docker image ha-gatekeeper:local, download the base images it needs (if you do not have them) and start the container(s): $GK_CONTAINER$(if proxy_enabled; then printf ', %s' "$CADDY_CONTAINER"; fi)")
   fi
 
   # --- what is explicitly left alone
