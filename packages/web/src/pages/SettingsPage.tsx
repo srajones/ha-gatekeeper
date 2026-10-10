@@ -76,7 +76,7 @@ function ConnectionCard({ connection, mode }: { connection: ConnectionStatus | n
         </dl>
         {usingLive && live.lastError && !live.connected ? (
           <p className="mt-4 rounded-md border border-[var(--danger-border)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
-            Last problem: {live.lastError}. It retries by itself (5 s, then 10 s, up to 60 s between attempts).
+            Last problem: {live.lastError.replace(/\.+$/, "")}. It retries by itself (5 s, then 10 s, up to 60 s between attempts).
           </p>
         ) : null}
       </CardContent>

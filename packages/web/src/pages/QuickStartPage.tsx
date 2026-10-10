@@ -205,7 +205,7 @@ export function QuickStartPage({
         <div className="rounded-lg border border-[var(--danger-border)] bg-[var(--danger-soft)] p-4 text-sm text-[var(--danger)]">
           <p className="font-medium">Cannot load Home Assistant data</p>
           <p className="mt-1">
-            Check HA_BASE_URL and HA_TOKEN, restart the server, then retry loading entities and services.
+            Check that Home Assistant is reachable from this server and that HA_BASE_URL and the Home Assistant token in .env are right (on a server install: sudo gatekeeper verify shows which). Then retry.
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <Button variant="secondary" onClick={onRetryEntities}>
