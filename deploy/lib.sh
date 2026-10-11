@@ -196,3 +196,41 @@ send_alert_all() {
   (( tried == 0 || delivered > 0 ))
 }
 
+# ---------------------------------------------------------------------------------------------
+# Docker Compose without the caller's environment leaking in.
+#
+# Compose gives variables exported in the shell priority over .env. So `export CORS_ORIGIN=...` in the
+# terminal that runs the installer made the installer start the container with one configuration, and the
+# systemd unit and the watchdog (clean environments, reading .env) later "fix" it by recreating the container
+# with another: a needless restart at the worst moment. Every compose call therefore runs with the variables
+# that docker-compose.yml interpolates (and COMPOSE_*) removed from the environment, so .env is the only source.
+# GK_COMPOSE_FILE is a deliberate test hook (the sandbox tests build through a proxy).
+# ---------------------------------------------------------------------------------------------
+
+compose_var_names() { # compose_var_names APP_DIR
+  {
+    # (|| true: a missing file or no match must not abort the rest under `set -e -o pipefail`)
+    { grep -ho '\${[A-Za-z_][A-Za-z0-9_]*' "$1/docker-compose.yml" "$1"/deploy/compose.*.yml 2>/dev/null || true; } | sed 's/^\${//'
+    printf '%s\n' COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME COMPOSE_ENV_FILES COMPOSE_PATH_SEPARATOR
+  } | sort -u
+}
+
+# compose_prefix APP_DIR -> sets COMPOSE_PREFIX, the command words to put before `docker compose ...`
+COMPOSE_PREFIX=()
+compose_prefix() {
+  local name
+  COMPOSE_PREFIX=(env)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && COMPOSE_PREFIX+=(-u "$name")
+  done < <(compose_var_names "$1")
+  [[ -z "${GK_COMPOSE_FILE:-}" ]] || COMPOSE_PREFIX+=("COMPOSE_FILE=$GK_COMPOSE_FILE")
+  return 0
+}
+
+compose_run() { # compose_run APP_DIR docker-compose-arguments...
+  local dir="$1"
+  shift
+  compose_prefix "$dir"
+  "${COMPOSE_PREFIX[@]}" docker compose "$@"
+}
+

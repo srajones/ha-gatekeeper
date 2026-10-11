@@ -121,7 +121,7 @@ in_grace() {
 # Environment
 # ---------------------------------------------------------------------------------------------
 
-dc() { ( cd "$APP_DIR" && timeout "$DC_TIMEOUT" docker compose "$@" ); }
+dc() { ( cd "$APP_DIR" && compose_prefix "$APP_DIR" && timeout "$DC_TIMEOUT" "${COMPOSE_PREFIX[@]}" docker compose "$@" ); }
 
 proxy_enabled() {
   local profiles
@@ -218,7 +218,7 @@ probe_gatekeeper() {
 # Only checks that something is listening: certificate problems (DNS not ready yet, ACME
 # retrying) must not make us restart Caddy, which would only reset its retry back-off.
 probe_proxy() {
-  timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null
+  timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${GK_CADDY_PROBE_PORT:-443}" 2>/dev/null
 }
 
 check_component() {
@@ -252,7 +252,7 @@ check_component() {
   if [[ "$name" == "$GK_CONTAINER" ]]; then
     probe_gatekeeper || { REASON="/healthz is not answering"; return 1; }
   else
-    probe_proxy || { REASON="nothing is listening on port 443"; return 1; }
+    probe_proxy || { REASON="nothing is listening on port ${GK_CADDY_PROBE_PORT:-443}"; return 1; }
   fi
   return 0
 }

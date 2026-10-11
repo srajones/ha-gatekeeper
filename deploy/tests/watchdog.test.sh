@@ -180,11 +180,12 @@ echo "G: proxy profile: caddy is watched too, and only a dead listener (not TLS/
 rm -f "$T/state/"*; : > "$T/calls.log"; : > "$T/wd.log"
 printf 'GATEKEEPER_PORT="18999"\nCOMPOSE_PROFILES="proxy"\n' > "$T/app/.env"
 echo "$running_healthy" > "$T/state.ha-gatekeeper"; echo "$running_healthy" > "$T/state.ha-gatekeeper-caddy"; touch "$T/http_ok"
+export GK_CADDY_PROBE_PORT=18443   # a test-controlled port: a real proxy on :443 must not influence this test
 run
-grep -q "caddy: check failed" "$T/wd.log" && ok "caddy with nothing on :443 flagged" || bad "caddy not checked: $(cat "$T/wd.log")"
+grep -q "caddy: check failed" "$T/wd.log" && ok "caddy with nothing on the proxy port flagged" || bad "caddy not checked: $(cat "$T/wd.log")"
 grep -q "caddy: .*restarting container" "$T/wd.log" && ok "caddy restarted after threshold" || bad "caddy not restarted"
 echo "  now a listener that accepts connections but speaks no valid TLS (like a proxy still waiting on its certificate):"
-(nohup node -e 'require("net").createServer(s=>s.on("error",()=>{})).listen(443,"127.0.0.1")' >/dev/null 2>&1 & echo $! > "$T/l443.pid"); sleep 1
+(nohup node -e 'require("net").createServer(s=>s.on("error",()=>{})).listen(18443,"127.0.0.1")' >/dev/null 2>&1 & echo $! > "$T/l443.pid"); sleep 1
 rm -f "$T/state/"*; : > "$T/wd.log"; : > "$T/calls.log"
 run; run
 grep -q "caddy" "$T/wd.log" && bad "caddy touched despite listening: $(cat "$T/wd.log")" || ok "listening-but-no-cert caddy left alone (ACME retry back-off not reset)"

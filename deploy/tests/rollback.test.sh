@@ -533,6 +533,64 @@ ck "bad ntfy and heartbeat URLs are caught" bash -c "grep -q 'urls: .*ALERT_NTFY
 ck "good URLs pass" out_has "urls-good: []"
 ck "the summary lists every configured channel" out_has "text: e-mail, ntfy, Telegram, heartbeat"
 
+echo "B1: compose never sees the caller's exported variables (they must not override .env)"
+run_case composeenv '
+  cp "$REPO/docker-compose.yml" "$APP_DIR/"; mkdir -p "$APP_DIR/deploy"
+  mkdir -p "$T/b1"
+  cat >"$T/b1/docker" <<"EOS"
+#!/usr/bin/env bash
+echo "SEEN cors=${CORS_ORIGIN:-unset} file=${COMPOSE_FILE:-unset} proxy=${TRUST_PROXY:-unset} profiles=${COMPOSE_PROFILES:-unset} port=${GATEKEEPER_PORT:-unset} keep=${KEEP_ME:-unset} args=$*"
+EOS
+  chmod +x "$T/b1/docker"
+  export PATH="$T/b1:$PATH"
+  export CORS_ORIGIN=https://evil.example COMPOSE_FILE=other.yml TRUST_PROXY=9 COMPOSE_PROFILES=nothing GATEKEEPER_PORT=1 KEEP_ME=yes
+  dc up -d
+  GK_COMPOSE_FILE="docker-compose.yml:deploy/x.yml" dc up -d
+'
+ck "exported CORS_ORIGIN does not reach compose" out_has "cors=unset"
+ck "exported COMPOSE_FILE, TRUST_PROXY, COMPOSE_PROFILES and GATEKEEPER_PORT do not reach compose" out_has "file=unset proxy=unset profiles=unset port=unset"
+ck "unrelated variables are left alone" out_has "keep=yes"
+ck "the test hook can still choose the compose files explicitly" out_has "file=docker-compose.yml:deploy/x.yml"
+
+echo "B2: the optional crash-recovery drill is asked after the install is committed"
+ck "cmd_install commits before it offers the drill" bash -c '
+  awk "/^cmd_install\(\)/,/^}/" "$1" | grep -n "" > /tmp/gk-cmdinstall.$$
+  c=$(grep -m1 "commit_install" /tmp/gk-cmdinstall.$$ | cut -d: -f1); d=$(grep -m1 "post_install_drill" /tmp/gk-cmdinstall.$$ | cut -d: -f1); v=$(grep -m1 "verify_all" /tmp/gk-cmdinstall.$$ | cut -d: -f1)
+  s=$(grep -c "should_drill" /tmp/gk-cmdinstall.$$); rm -f /tmp/gk-cmdinstall.$$
+  [[ -n "$c" && -n "$d" && -n "$v" && "$v" -lt "$c" && "$c" -lt "$d" && "$s" == 0 ]]' _ "$REPO/install.sh"
+run_case drillno '
+  DRILL=no
+  run_drill() { echo "DRILL RAN"; }
+  post_install_drill; echo "after-no: rc=$?"
+  DRILL=yes
+  run_drill() { echo "DRILL RAN"; V_FAIL=0; }
+  post_install_drill
+'
+ck "no drill when declined" bash -c "grep -q 'after-no: rc=0' '$CASE_OUT' && [[ \$(grep -c 'DRILL RAN' '$CASE_OUT') == 1 ]]"
+ck "a passing drill is reported" out_has "Crash-recovery drill passed"
+run_case drillfail '
+  DRILL=yes
+  run_drill() { V_FAIL=1; }
+  post_install_drill
+  echo "SHOULD NOT GET HERE"
+'
+ck "a failed drill is reported and does not roll anything back" bash -c "grep -q 'installation is complete and healthy, but the crash-recovery drill failed' '$CASE_OUT' && ! grep -q 'ROLLBACK started' '$T/install.log'"
+
+echo "C1: a container with our name that is not ours stops the install before anything changes"
+run_case nameclash '
+  docker_up() { return 0; }
+  docker() {
+    case "$*" in
+      *"inspect --type container ha-gatekeeper "*|"inspect --type container ha-gatekeeper") return 0 ;;
+      *"inspect --type container -f"*"ha-gatekeeper") echo "/srv/someone-else"; return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  (check_container_conflicts) ; echo "rc=$?"
+'
+ck "refused with an explanation" out_has "A container named 'ha-gatekeeper' already exists and does not belong to"
+ck "it names the other folder and promises nothing was changed" out_has "/srv/someone-else"
+
 echo "admin_login understands the two-factor step (verify and update must not fail when it is on)"
 run_case adminlogin2fa '
   CFG[ADMIN_PASSWORD]=pw

@@ -59,6 +59,14 @@ WireGuard), or `http://localhost:8123` if Home Assistant runs on the same server
 **Why HTTPS matters.** In production the admin session cookie is `Secure`, so the admin login
 only works over HTTPS (or `localhost`). That is why the installer sets up Caddy for you.
 
+**Settings come from `.env` only.** Variables exported in the shell that runs the installer (for example
+`export CORS_ORIGIN=...`) are not passed on to Docker Compose: every compose call (installer, watchdog, boot unit)
+runs with a clean environment, so they all read the same `.env` and nothing is recreated needlessly. To change a
+setting, use the installer's answers, an accepted `GATEKEEPER_*` / `ALERT_*` / `SMTP_*` variable, or edit `.env`.
+
+The optional crash-recovery drill is asked **after** the installation is complete and committed, so a dropped SSH
+session at that question can never undo a working install.
+
 ## Consent, rollback and what uninstall leaves
 
 1. **The complete list first.** After your questions the installer prints every change it will make:

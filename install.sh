@@ -488,7 +488,7 @@ rv_stack_down() { # rv_stack_down PREEXISTING(0|1)
   [[ "$1" == 1 ]] && return 0
   have docker && docker_ready || return 0
   if [[ -f "$APP_DIR/.env" ]]; then
-    ( cd "$APP_DIR" && docker compose --profile proxy down --remove-orphans ) || return 1
+    dc --profile proxy down --remove-orphans || return 1
   else
     docker rm -f "$GK_CONTAINER" "$CADDY_CONTAINER" 2>/dev/null || true
   fi
@@ -1814,7 +1814,7 @@ ensure_docker() {
   fi
 }
 
-dc() { ( cd "$APP_DIR" && docker compose "$@" ); }
+dc() { ( cd "$APP_DIR" && compose_run "$APP_DIR" "$@" ); }  # sanitized environment: see deploy/lib.sh
 
 caddy_image() {
   local img
@@ -2841,10 +2841,30 @@ verify_live_connection() {
   fi
 }
 
+# A container that was (re)created a moment ago needs time to open its port; do not call that a failure.
+app_recently_started() {
+  local st started age
+  st="$(container_field "$GK_CONTAINER" '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.StartedAt}}')"
+  [[ "$st" == running\|* ]] || return 1
+  [[ "$st" == *"|starting|"* ]] && return 0
+  started="${st##*|}"
+  age=$(( $(date +%s) - $(date -d "$started" +%s 2>/dev/null || echo 0) ))
+  (( age >= 0 && age < 180 ))
+}
+
 verify_app() {
   vsection "Application"
   local base code t
   base="$(local_url)"
+
+  if app_recently_started; then
+    local waited=0
+    until http_do GET "$base/healthz" "" && [[ "$LAST_CODE" == 200 ]]; do
+      (( waited >= 90 )) && break
+      sleep 3
+      waited=$((waited + 3))
+    done
+  fi
 
   if ! http_do GET "$base/healthz" ""; then
     vfail "The app does not answer on $base/healthz" "gatekeeper logs"
@@ -2914,12 +2934,12 @@ verify_app() {
   HTTP_COOKIE="$saved_cookie"
 
   verify_ha_from_container
-  verify_live_connection
 
   if $two_factor; then
-    vpass "Skipped the checks that need a signed-in dashboard session (entity list, temporary token): they would need a two-factor code"
+    vpass "Skipped the checks that need a signed-in dashboard session (live connection status, entity list, temporary token): they would need a two-factor code"
     return 0
   fi
+  verify_live_connection
 
   http_do GET "$FD_BASE/admin/ha/entities" "" "${FD_ARGS[@]}" || true
   local count entity other
@@ -3980,6 +4000,18 @@ should_drill() {
   fi
 }
 
+# The crash-recovery drill, after the install is final. A failed drill is reported loudly but does not undo anything.
+post_install_drill() {
+  should_drill || return 0
+  V_PASS=0; V_WARN=0; V_FAIL=0
+  run_drill
+  if (( V_FAIL > 0 )); then
+    warn "The installation is complete and healthy, but the crash-recovery drill failed (see above). Automatic restarts may not work: run  gatekeeper verify --drill  after fixing the cause."
+    exit 1
+  fi
+  ok "Crash-recovery drill passed: a crash and a stop were both healed by themselves."
+}
+
 print_summary() { # print_summary [failed]
   local url="${CFG[GATEKEEPER_PUBLIC_URL]}" ip
   if [[ "${1:-}" == failed ]]; then
@@ -4374,15 +4406,16 @@ cmd_install() {
   step 7 7 "Verifying everything"
   JUST_INSTALLED=true
   fail_point before-verify
-  local drill=""
-  should_drill && drill=with-drill
   local verified=true
-  verify_all "$drill" || verified=false
+  verify_all "" || verified=false
 
   if $verified; then
     commit_install
     print_summary
     print_changes_summary
+    # The optional crash-recovery drill is asked AFTER the install is committed: a dropped SSH session at that
+    # question must never undo a complete, verified installation.
+    post_install_drill
     return 0
   fi
 
@@ -4830,7 +4863,7 @@ cmd_uninstall() {
   [[ -L "$BIN_LINK" ]] && rm -f "$BIN_LINK"
 
   if have docker && docker_up; then
-    ( cd "$APP_DIR" && docker compose --profile proxy down --remove-orphans ) >>"$LOG_FILE" 2>&1 || true
+    dc --profile proxy down --remove-orphans >>"$LOG_FILE" 2>&1 || true
     ok "Stopped and removed the containers"
     if confirm_purge "Also delete the built images?" n; then
       docker rmi ha-gatekeeper:local ha-gatekeeper:previous >>"$LOG_FILE" 2>&1 || true
