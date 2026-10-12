@@ -76,6 +76,10 @@ if [[ -n "$SELF_DIR" && -f "$SELF_DIR/deploy/proxy.sh" ]]; then
   # shellcheck source=deploy/proxy.sh
   source "$SELF_DIR/deploy/proxy.sh"
 fi
+if [[ -n "$SELF_DIR" && -f "$SELF_DIR/deploy/proxy_apply.sh" ]]; then
+  # shellcheck source=deploy/proxy_apply.sh
+  source "$SELF_DIR/deploy/proxy_apply.sh"
+fi
 
 ORIG_ARGS=("$@")
 COMMAND="install"
@@ -865,6 +869,8 @@ compute_missing_prereqs() {
   # fuser (psmisc) lets the installer tell a busy apt lock from a stale one; minimal images lack it.
   if [[ "$PKG" == apt ]]; then have fuser || P_PKGS+=(psmisc); fi
   [[ -e /etc/ssl/certs/ca-certificates.crt || -d /etc/pki/tls/certs || -e /etc/ssl/cert.pem ]] || P_PKGS+=(ca-certificates)
+  # certbot, only when the optional nginx/certificate setup was chosen and the server has none
+  if ${P_PROXY_CERTBOT_PKG:-false}; then have certbot || P_PKGS+=(certbot); fi
   return 0
 }
 
@@ -1224,6 +1230,7 @@ CFG_KEYS=(
   ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL
   ALERT_NAME ALERT_EMAIL_TO SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USER SMTP_PASSWORD SMTP_FROM
   ALERT_NTFY_URL ALERT_NTFY_TOKEN ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID HEARTBEAT_URL
+  PROXY_SETUP
 )
 
 # Only these may come from the process environment. Deliberately not COMPOSE_*, LOG_LEVEL or
@@ -1234,6 +1241,7 @@ ENV_ACCEPTED_KEYS=(
   ADMIN_ALLOWED_IPS ALERT_WEBHOOK_URL GATEKEEPER_PORT GATEKEEPER_DATA_DIR GATEKEEPER_PUBLIC_URL
   ALERT_NAME ALERT_EMAIL_TO SMTP_HOST SMTP_PORT SMTP_SECURITY SMTP_USER SMTP_PASSWORD SMTP_FROM
   ALERT_NTFY_URL ALERT_NTFY_TOKEN ALERT_TELEGRAM_BOT_TOKEN ALERT_TELEGRAM_CHAT_ID HEARTBEAT_URL
+  PROXY_SETUP
 )
 
 # Keys that are only meaningful inside the compose project itself; empty ones are not written.
@@ -1314,6 +1322,8 @@ derive_config() {
       ;;
   esac
   CFG[CORS_ORIGIN]="${CFG[GATEKEEPER_PUBLIC_URL]}"
+  # The optional nginx/certificate setup only makes sense behind your own web server on an https address.
+  if [[ "${CFG[GATEKEEPER_MODE]}" != local || "${CFG[GATEKEEPER_PUBLIC_URL]}" != https://* ]]; then CFG[PROXY_SETUP]=""; fi
 
   # "localhost" inside the container is the container itself, so an HA on this same server has to
   # be addressed as host.docker.internal (enabled through a small compose override).
@@ -1368,6 +1378,7 @@ config_problems() {
   (( ${#sess} >= 8 )) || echo "ADMIN_SESSION_SECRET is missing or too short"
   (( ${#hash} >= 16 )) || echo "API_KEY_HASH_SECRET is missing or too short (min 16)"
 
+  case "${CFG[PROXY_SETUP]:-}" in ""|nginx|manual) ;; *) echo "PROXY_SETUP must be empty, nginx or manual" ;; esac
   is_uint "${CFG[AUDIT_LOG_RETENTION_DAYS]:-}" || echo "AUDIT_LOG_RETENTION_DAYS must be a whole number (0 keeps everything)"
   case "${CFG[LOG_LEVEL]:-info}" in trace|debug|info|warn|error|fatal) ;; *) echo "LOG_LEVEL must be trace, debug, info, warn, error or fatal" ;; esac
   local port="${CFG[GATEKEEPER_PORT]:-}"
@@ -3306,7 +3317,13 @@ verify_all() { # verify_all [with-drill]
   verify_containers
   verify_secrets
   verify_app
-  if proxy_enabled; then verify_public; else verify_behind_proxy; fi
+  if proxy_enabled; then verify_public
+  elif px_managed; then
+    vsection "Your nginx site and certificate (set up by this installer)"
+    PX_RENEW_DRYRUN=$JUST_INSTALLED
+    px_checks "$(px_managed_host)"
+    PX_RENEW_DRYRUN=false
+  else verify_behind_proxy; fi
   verify_automation
   verify_alerts
   verify_data
@@ -3861,7 +3878,7 @@ run_wizard() {
   case "${CFG[GATEKEEPER_MODE]}" in
     domain) wizard_domain ;;
     selfsigned) wizard_selfsigned ;;
-    local) wizard_behind_proxy ;;
+    local) wizard_behind_proxy; derive_config; px_wizard_proxy ;;
   esac
   wizard_home_assistant
   wizard_admin_password
@@ -4058,10 +4075,26 @@ print_summary() { # print_summary [failed]
         say "      ${C_BOLD}    proxy_set_header X-Forwarded-Proto \$scheme;${C_RESET}"
         say "      ${C_BOLD}}${C_RESET}"
         say "  ${C_DIM}then reload it (nginx -t && systemctl reload nginx) and run: gatekeeper verify${C_RESET}"
-        say ""
-        say "  ${C_BOLD}New subdomain, certificate, nginx file: don't know where to start?${C_RESET} Run  ${C_BOLD}sudo gatekeeper proxy-help${C_RESET}  for a"
-        say "  step-by-step guide (DNS record, Let's Encrypt certificate that leaves your existing ones alone, a ready nginx file)."
-        say "  Afterwards  ${C_BOLD}sudo gatekeeper proxy-check${C_RESET}  tests the whole chain and tells you what to fix. Both only look; they change nothing."
+        if px_managed; then
+          say ""
+          say "  ${C_BOLD}nginx and the certificate were set up by this installer for $(px_managed_host):${C_RESET}"
+          say "    * new site file ${P_PROXY_SITE:-$(px_site_path "$(px_managed_host)")} (the only nginx file added; your other sites were not edited)"
+          say "    * certificate for $(px_managed_host) only, renewing itself (tested with a renewal rehearsal)"
+          say "    * safety copy of your nginx and certbot settings: ${PX_LAST_WEB_BACKUP:-$APP_DIR/backups/web-config-*.tar.gz}"
+          say "  Put everything back the way it was:  ${C_BOLD}sudo gatekeeper web-restore${C_RESET}   |   remove just this setup:  ${C_BOLD}sudo gatekeeper uninstall${C_RESET}"
+          say "  Re-test it any time:  ${C_BOLD}sudo gatekeeper proxy-check${C_RESET}"
+        elif [[ "${CFG[PROXY_SETUP]:-}" == manual ]]; then
+          say ""
+          say "  ${C_BOLD}You chose to set up nginx and the certificate yourself. Here are the exact steps for what I found on this server${C_RESET}"
+          say "  ${C_DIM}(nothing below has been run; copy each command when you are ready; test afterwards with: sudo gatekeeper proxy-check)${C_RESET}"
+          COMMAND_ARGS=("$(px_managed_host)")
+          cmd_proxy_help || true
+        else
+          say ""
+          say "  ${C_BOLD}New subdomain, certificate, nginx file: don't know where to start?${C_RESET} Run  ${C_BOLD}sudo gatekeeper proxy-help${C_RESET}  for a"
+          say "  step-by-step guide (DNS record, Let's Encrypt certificate that leaves your existing ones alone, a ready nginx file)."
+          say "  Afterwards  ${C_BOLD}sudo gatekeeper proxy-check${C_RESET}  tests the whole chain and tells you what to fix. Both only look; they change nothing."
+        fi
       else
         ip="$(public_ip 4 || echo '<server-ip>')"
         say ""
@@ -4142,6 +4175,7 @@ decide_changes() {
   pick_app_port
   check_web_ports || die "Nothing was changed."
   check_local_ha_firewall || die "Nothing was changed."
+  px_decide_proxy || die "Nothing was changed."
 }
 
 # Home Assistant on this very server, an active firewall, and the installer told not to touch it:
@@ -4255,7 +4289,9 @@ build_plan() {
       PLAN_KEEP+=("Port $p is used by ${owner:-another program}: it is not stopped, changed or reconfigured")
     fi
   done
-  if [[ -x /usr/sbin/nginx || -x /usr/sbin/apache2 || -x /usr/sbin/httpd ]]; then
+  if $P_PROXY; then
+    px_plan_proxy
+  elif [[ -x /usr/sbin/nginx || -x /usr/sbin/apache2 || -x /usr/sbin/httpd ]]; then
     PLAN_KEEP+=("Your web server (nginx/Apache) configuration is never read or modified")
   fi
 }
@@ -4284,6 +4320,7 @@ print_plan() {
   say "${C_BOLD}Left untouched${C_RESET}"
   for line in "${PLAN_KEEP[@]}"; do say "   * $line"; done
   say ""
+  px_print_plan_files
 }
 
 # One decision for the whole list. Default is NO. --yes approves it for unattended runs.
@@ -4416,10 +4453,12 @@ cmd_install() {
   apply_and_start
   fail_point after-start
 
-  step 6 7 "Automatic restarts, watchdog and firewall"
+  step 6 7 "Automatic restarts, watchdog, firewall and web server"
   install_automation
   if [[ "${CFG[GATEKEEPER_MODE]}" == local ]]; then remove_firewall_rules; fi
   open_firewall
+  px_apply_proxy
+  fail_point after-proxy
   cmd_backup || warn "The first backup did not complete; run: gatekeeper backup"
   fail_point after-automation
 
@@ -4893,6 +4932,7 @@ cmd_uninstall() {
     fi
   fi
 
+  px_uninstall_proxy
   if confirm_purge "Delete your DATA (database with all tokens and the audit log) in $(data_dir_abs)?" n; then
     rm -rf "$(data_dir_abs)"
     ok "Deleted the data folder"
@@ -4948,6 +4988,8 @@ Commands
   proxy-help [NAME]  Step-by-step guide to put Gatekeeper on a new subdomain behind the nginx and Let's Encrypt
                      you already run (DNS, certificate, nginx file, tests). Read-only: changes nothing.
   proxy-check [NAME] Tests that setup from every angle (DNS, certificate, nginx, login) and says what to fix.
+  web-backup         Save a copy of your nginx and certbot settings (/etc/nginx, /etc/letsencrypt) in one root-only file.
+  web-restore [FILE] Put a saved copy back (takes a fresh copy of the current state first, asks before writing).
   help
 
 Options
@@ -5001,7 +5043,7 @@ parse_args() {
       --quiet) QUIET=true ;;
       -v|--verbose) VERBOSE=true ;;
       --no-color) NO_COLOR_FLAG=true ;;
-      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|alerts|proxy-help|proxy-check|help)
+      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|alerts|proxy-help|proxy-check|web-backup|web-restore|help)
         if $have_command; then
           COMMAND_ARGS+=("$arg")
         else
@@ -5148,6 +5190,8 @@ main() {
   source "$APP_DIR/deploy/lib.sh"
   # shellcheck source=deploy/proxy.sh
   [[ -f "$APP_DIR/deploy/proxy.sh" ]] && source "$APP_DIR/deploy/proxy.sh"
+  # shellcheck source=deploy/proxy_apply.sh
+  [[ -f "$APP_DIR/deploy/proxy_apply.sh" ]] && source "$APP_DIR/deploy/proxy_apply.sh"
 
   # Re-entered after the download step above: pick up what that step changed so it can be undone too.
   if [[ -n "${GK_BOOT_TMP:-}" && -d "${GK_BOOT_TMP:-}" ]]; then
@@ -5181,6 +5225,8 @@ main() {
     alerts)    cmd_alerts ;;
     proxy-help)  cmd_proxy_help ;;
     proxy-check) cmd_proxy_check ;;
+    web-backup)  cmd_web_backup ;;
+    web-restore) cmd_web_restore ;;
     *)         usage; exit 1 ;;
   esac
 }

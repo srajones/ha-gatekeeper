@@ -210,7 +210,7 @@ ck "explains why the HA name is refused" out_has "is the address your Home Assis
 echo "proxy-help: read-only, verbose, correct"
 reset_world
 NG_BEFORE="$(tree_hash "$NG")"; LE_BEFORE="$(tree_hash "$LE")"
-run_case help1 'COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help1 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 t "exit status" 0 "$RC"
 for n in 1 2 3 4 5 6 7; do ck "step $n is printed" out_has "STEP $n OF 7"; done
 ck "tells the user nothing is changed" out_has "never changes nginx, your certificates, DNS or the firewall"
@@ -236,7 +236,7 @@ ck "written files contain no secrets" bash -c "! grep -rqi 'correct-horse' '$APP
 
 echo "proxy-help: existing certificate / wildcard / name clash / DNS problems"
 reset_world
-run_case help2 'COMMAND_ARGS=(proxy-help gk.example.org); cmd_proxy_help'
+run_case help2 'COMMAND_ARGS=(gk.example.org); cmd_proxy_help'
 ck "wildcard certificate reused, nothing to issue" out_has "wildcard"
 ck "step 4 skipped" out_has "Certificate: already there, skipping"
 ck "final file uses the existing wildcard folder" out_has "$LE/live/wildcard.example.com/fullchain.pem"
@@ -244,30 +244,33 @@ ck "no certbot command suggested for issuing" out_lacks "certbot certonly"
 ck "does not claim the DNS is fine when it is not" out_has "gk.example.org does not resolve yet"
 
 reset_world; printf 'gk.example.com 198.51.100.9\n' >"$FAKE/dns4"
-run_case help3 'COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help3 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "wrong DNS target is called out" out_has "currently points to 198.51.100.9, which is NOT this server"
 
 reset_world; printf 'gk.example.com 203.0.113.7\n' >"$FAKE/dns4"; printf 'gk.example.com 2001:db8::5\n' >"$FAKE/dns6"
-run_case help4 'GK_PX_SERVER_IP6=2001:db8::1; px_detect; COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help4 'GK_PX_SERVER_IP6=2001:db8::1; px_detect; COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "a stray IPv6 record is called out" out_has "(AAAA) record (2001:db8::5) that is NOT this server"
 
 reset_world; printf 'server { server_name gk.example.com; }\n' >"$FAKE/nginx.extra"
-run_case help5 'COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help5 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "an existing server block for the name is detected" out_has "ALREADY has a server block for gk.example.com"
 
 reset_world; touch "$FAKE/has-nginx-plugin"
-run_case help6 'COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help6 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "nginx plugin on disk (apt) -> nginx authenticator offered" out_has "sudo certbot certonly --nginx -d gk.example.com --dry-run"
 ck "still no certbot execution" bash -c "! grep -q '^certbot' '$FAKE/calls'"
 
+reset_world; printf '# listen [::]:80 default_server;   (a comment must not count)\n' >"$FAKE/nginx.extra"
+run_case help6b 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
+ck "a commented-out IPv6 listen line does not enable IPv6" out_lacks "listen [::]:443 ssl;"
 reset_world; printf 'server { listen [::]:443 ssl; server_name other.example.com; }\n' >"$FAKE/nginx.extra"
-run_case help7 'COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help7 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "IPv6 listen lines appear only when nginx already listens on IPv6" out_has "listen [::]:443 ssl;"
 ck "the safety copy is the first thing suggested" out_has "take a safety copy"
-ck "the safety copy command is root-only and covers nginx and letsencrypt" out_has "tar czf /root/web-backup-"
+ck "the safety copy command is the installer's own web-backup" out_has "sudo gatekeeper web-backup"
 
 reset_world; mkdir -p "$ROOT/nonginx"
-run_case help8 'GK_NGINX_DIR="'"$ROOT"'/nonginx"; PX_NGINX_DIR="'"$ROOT"'/nonginx"; COMMAND_ARGS=(proxy-help gk.example.com); cmd_proxy_help'
+run_case help8 'GK_NGINX_DIR="'"$ROOT"'/nonginx"; PX_NGINX_DIR="'"$ROOT"'/nonginx"; COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
 ck "no sites-enabled / conf.d: a clear explanation, not a crash" out_has "Could not find"
 t "still exits 0" 0 "$RC"
 
@@ -275,7 +278,7 @@ t "still exits 0" 0 "$RC"
 echo "proxy-check"
 reset_world
 NG_BEFORE="$(tree_hash "$NG")"; LE_BEFORE="$(tree_hash "$LE")"
-run_case check1 'COMMAND_ARGS=(proxy-check gk.example.com); GK_PX_SERVER_IP4=203.0.113.7; cmd_proxy_check'
+run_case check1 'COMMAND_ARGS=(gk.example.com); GK_PX_SERVER_IP4=203.0.113.7; cmd_proxy_check'
 ck "all sections are run" bash -c "for n in 1 2 3 4 5 6 7; do grep -q \"^\$n\\. \" '$OUT' || exit 1; done"
 ck "DNS pass" out_has "gk.example.com points at this server"
 ck "certificate for the wrong name is detected" out_has "is for: ha.example.com"
@@ -291,22 +294,22 @@ t "fake nginx tree unchanged" "$NG_BEFORE" "$(tree_hash "$NG")"
 t "fake letsencrypt tree unchanged" "$LE_BEFORE" "$(tree_hash "$LE")"
 
 reset_world; mkcert gk.example.com 80 gk.example.com; cp "$LE/live/gk.example.com/fullchain.pem" "$FAKE/presented.pem"
-run_case check2 'COMMAND_ARGS=(proxy-check gk.example.com); cmd_proxy_check'
+run_case check2 'COMMAND_ARGS=(gk.example.com); cmd_proxy_check'
 ck "right certificate: name covered" out_has "covers that name"
 ck "certificate validity period reported" out_has "The certificate is valid for another"
 ck "healthy setup is reported ready" bash -c "grep -q 'is ready' '$OUT' || grep -q 'works, with' '$OUT'"
 ck "no [FAIL] lines in a healthy setup" bash -c "! grep -q '\[FAIL\]' '$OUT'"
 
 reset_world; mkcert gk.example.com 80 gk.example.com; cp "$LE/live/gk.example.com/fullchain.pem" "$FAKE/presented.pem"; touch "$FAKE/proxy-502"
-run_case check3 'COMMAND_ARGS=(proxy-check gk.example.com); cmd_proxy_check'
+run_case check3 'COMMAND_ARGS=(gk.example.com); cmd_proxy_check'
 ck "502 explains proxy_pass" out_has "could not reach Gatekeeper (HTTP 502)"
 
 reset_world; mkcert gk.example.com 80 gk.example.com; cp "$LE/live/gk.example.com/fullchain.pem" "$FAKE/presented.pem"
-run_case check4 'export FAKE_COOKIE_SECURE=""; COMMAND_ARGS=(proxy-check gk.example.com); cmd_proxy_check'
+run_case check4 'export FAKE_COOKIE_SECURE=""; COMMAND_ARGS=(gk.example.com); cmd_proxy_check'
 ck "a cookie that is not Secure is a failure with the cause" out_has "NOT marked Secure"
 
 reset_world; rm -f "$FAKE/dns4"; touch "$FAKE/no-tls"
-run_case check5 'COMMAND_ARGS=(proxy-check gk.example.com); cmd_proxy_check'
+run_case check5 'COMMAND_ARGS=(gk.example.com); cmd_proxy_check'
 ck "no DNS record is reported with the record to create" out_has "does not resolve"
 ck "no certificate from nginx is reported with next step" out_has "Could not read a certificate from nginx"
 
@@ -316,7 +319,7 @@ mkdir -p "$ROOT/exp"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$ROOT/exp/k.pem" -out "$ROOT/exp/c.pem" -subj "/CN=gk.example.com" \
   -addext "subjectAltName=DNS:gk.example.com" -days 1 >/dev/null 2>&1
 cp "$ROOT/exp/c.pem" "$FAKE/presented.pem"
-run_case check6 'COMMAND_ARGS=(proxy-check gk.example.com); cmd_proxy_check'
+run_case check6 'COMMAND_ARGS=(gk.example.com); cmd_proxy_check'
 ck "a certificate close to expiry is flagged" bash -c "grep -Eq 'expires in [0-9]+ day|EXPIRED' '$OUT'"
 
 # =============================================================================================== wiring

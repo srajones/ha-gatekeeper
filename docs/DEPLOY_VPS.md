@@ -231,6 +231,8 @@ Docker bypasses ufw for published ports, so the app's own port stays bound to `1
 
 ## Already running nginx and Let's Encrypt? Add a subdomain safely
 
-If this server already has nginx and certbot (or acme.sh) for other sites, use option 3 in the installer and follow
-[SUBDOMAIN_AND_CERTS.md](SUBDOMAIN_AND_CERTS.md): `sudo gatekeeper proxy-help` explains DNS, the certificate and the nginx
-file step by step (changing nothing itself), and `sudo gatekeeper proxy-check` tests the finished setup.
+Use option 3 in the installer and enter the new name. The installer can (only if you choose) set up the nginx site and
+a certificate for just that name with a safety copy of your nginx and certbot settings first, the exact files and
+commands shown before anything changes, and automatic undo; or print the exact commands for you to run. See
+[SUBDOMAIN_AND_CERTS.md](SUBDOMAIN_AND_CERTS.md). Handy commands: `gatekeeper web-backup`, `gatekeeper web-restore`,
+`gatekeeper proxy-help`, `gatekeeper proxy-check`.

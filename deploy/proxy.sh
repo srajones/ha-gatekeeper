@@ -13,6 +13,13 @@
 
 PX_LE_DIR="${GK_LETSENCRYPT_DIR:-/etc/letsencrypt}"
 PX_NGINX_DIR="${GK_NGINX_DIR:-/etc/nginx}"
+# Folder for Let's Encrypt challenge files of the managed setup (its own folder; /var/www/html is never used or touched).
+PX_WEBROOT="${GK_ACME_WEBROOT:-/var/www/ha-gatekeeper-acme}"
+# Where the guide's challenge location points (the manual guide uses the common /var/www/html; the managed setup its own folder).
+PX_ACME_ROOT="/var/www/html"
+# First line of every file the installer writes itself: uninstall only ever deletes files that carry it.
+PX_MARK="# Managed by the HA Gatekeeper installer. To remove: sudo gatekeeper uninstall  (or delete this file and its link in sites-enabled, then: sudo nginx -t && sudo systemctl reload nginx)"
+PX_MANAGED=false
 
 # ---------------------------------------------------------------------------------------------
 # Small output helpers
@@ -68,7 +75,9 @@ px_detect() {
   if [[ -z "$PX_SERVER_IP6" && -z "${GK_PX_SERVER_IP6+x}" ]]; then PX_SERVER_IP6="$(public_ip 6 || true)"; fi
 
   PX_NGINX=""; PX_NGINX_VERSION=""; PX_NGINX_RUNNING=false; PX_NGINX_STYLE=""
-  if have nginx; then
+  if [[ -n "${GK_NGINX_BIN+x}" ]]; then
+    [[ -x "$GK_NGINX_BIN" ]] && PX_NGINX="$GK_NGINX_BIN"   # test hook: a fixed (or missing) nginx binary
+  elif have nginx; then
     PX_NGINX="$(command -v nginx)"
   elif [[ -x /usr/sbin/nginx ]]; then
     PX_NGINX=/usr/sbin/nginx
@@ -81,7 +90,8 @@ px_detect() {
   # Only listen on IPv6 if the existing nginx configuration already does (otherwise a new "listen [::]" line could fail on a
   # server without IPv6). If the configuration cannot be read, stay on IPv4 only: that always works.
   PX_NGINX_IPV6=false
-  if [[ -n "$PX_NGINX" ]] && px_nginx_config_dump | grep -Eq 'listen[[:space:]]+\[::\]'; then PX_NGINX_IPV6=true; fi
+  # (comment lines are ignored: Ubuntu's default site carries commented-out example blocks that mention [::])
+  if [[ -n "$PX_NGINX" ]] && px_nginx_config_dump | grep -Ev '^[[:space:]]*#' | grep -Eq 'listen[[:space:]]+\[::\]'; then PX_NGINX_IPV6=true; fi
   if [[ -d "$PX_NGINX_DIR/sites-enabled" ]]; then PX_NGINX_STYLE=sites
   elif [[ -d "$PX_NGINX_DIR/conf.d" ]]; then PX_NGINX_STYLE=confd; fi
 
@@ -247,7 +257,10 @@ px_listen_lines() { # px_listen_lines PORT [ssl] -> the listen line(s) for this 
   if $PX_NGINX_IPV6; then printf '    listen [::]:%s%s;\n' "$port" "$ssl"; fi
 }
 
+px_mark_line() { if $PX_MANAGED; then printf '%s\n' "$PX_MARK"; fi; }
+
 px_http_block() { # px_http_block HOST  (step A: port 80 only, so the certificate can be issued)
+  px_mark_line
   cat <<EOF
 # Gatekeeper, step A: answers on port 80 only.
 # It exists so Let's Encrypt can prove you own $1, and it forwards everything else to https.
@@ -257,7 +270,7 @@ $(px_listen_lines 80)
 
     # Let's Encrypt writes a small token here (only used by the "webroot" method).
     location /.well-known/acme-challenge/ {
-        root /var/www/html;
+        root $PX_ACME_ROOT;
         default_type "text/plain";
     }
 
@@ -272,6 +285,7 @@ EOF
 # sites you already have on the same ports, and Gatekeeper does not need them.
 px_https_block() { # px_https_block HOST CERTDIR PORT
   local host="$1" certdir="$2" port="$3"
+  px_mark_line
   cat <<EOF
 # Gatekeeper, step B: the finished site. Port 80 redirects to https, port 443 forwards to Gatekeeper.
 server {
@@ -279,7 +293,7 @@ $(px_listen_lines 80)
     server_name $host;
 
     location /.well-known/acme-challenge/ {
-        root /var/www/html;
+        root $PX_ACME_ROOT;
         default_type "text/plain";
     }
 
@@ -351,7 +365,7 @@ cmd_proxy_help() {
   say "  ${C_DIM}that keep your other sites running. Touching those automatically is how sites get broken, so this guide only${C_RESET}"
   say "  ${C_DIM}adds ONE new, separate file for the new name and leaves every existing file exactly as it is.${C_RESET}"
 
-  host="$(px_choose_host "${COMMAND_ARGS[1]:-}")" || return 1
+  host="$(px_choose_host "${COMMAND_ARGS[0]:-}")" || return 1
 
   # ------------------------------------------------------------------ what is on this server
   px_title "STEP 1 OF 7" "What is already on this server (looking only, changing nothing)"
@@ -413,9 +427,9 @@ cmd_proxy_help() {
   fi
 
   say ""
-  say "  ${C_BOLD}Before you change anything, take a safety copy${C_RESET} (it takes a second, and lets you restore everything exactly as it is now):"
-  px_cmd "sudo sh -c 'umask 077; tar czf /root/web-backup-\$(date +%F).tgz /etc/nginx /etc/letsencrypt'"
-  say "  ${C_DIM}It is saved in /root (only root can read it, because /etc/letsencrypt holds private keys). Nothing in this guide deletes or edits existing files.${C_RESET}"
+  say "  ${C_BOLD}Before you change anything, take a safety copy${C_RESET} of your nginx and certbot settings (it takes a second):"
+  px_cmd "sudo gatekeeper web-backup"
+  say "  ${C_DIM}Saved as one root-only file in $APP_DIR/backups (it contains your certificate keys). Put everything back any time with: sudo gatekeeper web-restore${C_RESET}"
 
   # ------------------------------------------------------------------ DNS
   px_title "STEP 2 OF 7" "DNS: tell the internet that $host lives on this server"
@@ -598,15 +612,13 @@ px_days_until() { # px_days_until "Mon DD HH:MM:SS YYYY GMT" -> integer days (ne
   printf '%s' $(( (end - now) / 86400 ))
 }
 
-cmd_proxy_check() {
-  load_runtime_config
-  local host port base cert_info issuer enddate sans days name_ok n code addr
+# px_checks HOST: sections 1-7 (counts into V_PASS/V_WARN/V_FAIL). Used by proxy-check and, for the managed setup, by verify.
+# Read-only, except that the managed setup (PX_RENEW_DRYRUN=true) also rehearses renewal against Let's Encrypt's staging server.
+PX_RENEW_DRYRUN=false
+px_checks() {
+  local host="$1" port base cert_info issuer enddate sans days name_ok n code addr
   port="${CFG[GATEKEEPER_PORT]:-8080}"
-  host="$(px_choose_host "${COMMAND_ARGS[1]:-${CFG[GATEKEEPER_PUBLIC_URL]:+$(url_host "${CFG[GATEKEEPER_PUBLIC_URL]}")}}")" || return 1
   base="https://$host"
-  V_PASS=0; V_WARN=0; V_FAIL=0
-  banner "Checking $host"
-  say "  Read-only: this only looks and tests, it changes nothing. Each line says what was tested and, if it failed, what to do."
   px_detect
 
   vsection "1. Gatekeeper itself"
@@ -742,13 +754,34 @@ cmd_proxy_check() {
   vsection "7. Renewal (so the certificate does not expire in 90 days)"
   if [[ -n "$PX_CERTBOT" ]]; then
     if [[ -n "$PX_CERTBOT_RENEWS" ]]; then vpass "certbot renews automatically through $PX_CERTBOT_RENEWS"
+    elif [[ -e "${GK_CERT_RENEW_UNIT:-/etc/systemd/system/ha-gatekeeper-cert-renew.timer}" || -e "${GK_CERT_RENEW_CRON:-/etc/cron.d/ha-gatekeeper-cert-renew}" ]]; then
+      vpass "This certificate renews automatically through the renewal job the installer added for $host"
     else vwarn "No automatic certbot renewal job was found" "Check: systemctl list-timers | grep -i certbot   (certbot normally installs one)"; fi
-    say "        ${C_DIM}For a full rehearsal of renewal (changes nothing): sudo certbot renew --dry-run${C_RESET}"
+    if $PX_RENEW_DRYRUN; then
+      if timeout 180 "$PX_CERTBOT" renew --dry-run --cert-name "$host" >>"$LOG_FILE" 2>&1; then
+        vpass "A rehearsal of renewal for $host succeeded (Let's Encrypt staging server; nothing was changed)"
+      else
+        vfail "A rehearsal of renewal for $host FAILED, so the certificate would expire in about 90 days" "See: sudo tail -n 40 /var/log/letsencrypt/letsencrypt.log  (usually port 80 or the challenge folder $PX_WEBROOT is not reachable)"
+      fi
+    else
+      say "        ${C_DIM}For a full rehearsal of renewal (changes nothing): sudo certbot renew --dry-run --cert-name $host${C_RESET}"
+    fi
   elif [[ -n "$PX_ACMESH" ]]; then
     vpass "acme.sh is installed; it renews through its own cron job (check: crontab -l | grep acme)"
   else
     vwarn "Neither certbot nor acme.sh was found on this server" "If the certificate comes from somewhere else (a panel, a load balancer), make sure it renews there"
   fi
+}
+
+cmd_proxy_check() {
+  load_runtime_config
+  local host base
+  host="$(px_choose_host "${COMMAND_ARGS[0]:-${CFG[GATEKEEPER_PUBLIC_URL]:+$(url_host "${CFG[GATEKEEPER_PUBLIC_URL]}")}}")" || return 1
+  base="https://$host"
+  V_PASS=0; V_WARN=0; V_FAIL=0
+  banner "Checking $host"
+  say "  Read-only: this only looks and tests, it changes nothing. Each line says what was tested and, if it failed, what to do."
+  px_checks "$host"
 
   say ""
   if (( V_FAIL > 0 )); then
@@ -763,3 +796,277 @@ cmd_proxy_check() {
   say "  Open $base in your browser and log in. API base URL for agents: $base"
   return 0
 }
+
+# =============================================================================================================
+# The OPTIONAL managed setup: the installer does the nginx site + certificate for you, with you watching.
+# (Choice 1 in the installer. Choice 2 prints the same steps as commands to run yourself: gatekeeper proxy-help.)
+#
+# Principles:
+#   * a complete plan of exact files and commands is shown before anything changes, and needs your yes;
+#   * a safety copy of your nginx and certbot settings is taken before the first change and is never deleted;
+#   * ONE new site file for the new name, its own challenge folder, a certificate for that name only;
+#     existing sites, existing certificates, existing renewal jobs are never edited;
+#   * `nginx -t` runs before every reload, and a reload never happens when it fails;
+#   * every step is journaled; any failure undoes the file changes (the new certificate is kept on purpose, with
+#     the one command that deletes it, so a retry does not burn Let's Encrypt's weekly limits).
+# =============================================================================================================
+
+P_PROXY=false
+P_PROXY_CERT=""            # issue | reuse
+P_PROXY_CERT_DIR=""
+P_PROXY_RENEW_JOB=false    # add a renewal job just for this certificate (only when the server has none)
+P_PROXY_CERTBOT_PKG=false  # certbot has to be installed (apt)
+P_PROXY_SITE=""; P_PROXY_LINK=""
+PX_HOST=""
+
+PX_RENEW_SERVICE_NAME="ha-gatekeeper-cert-renew.service"
+PX_RENEW_TIMER_NAME="ha-gatekeeper-cert-renew.timer"
+px_renew_timer_path() { printf '%s/%s' "${SYSTEMD_DIR:-/etc/systemd/system}" "$PX_RENEW_TIMER_NAME"; }
+px_renew_service_path() { printf '%s/%s' "${SYSTEMD_DIR:-/etc/systemd/system}" "$PX_RENEW_SERVICE_NAME"; }
+px_renew_cron_path() { printf '%s' "${GK_CERT_RENEW_CRON:-/etc/cron.d/ha-gatekeeper-cert-renew}"; }
+
+px_managed_host() { url_host "${CFG[GATEKEEPER_PUBLIC_URL]:-}" 2>/dev/null || true; }
+px_managed() { [[ "${CFG[PROXY_SETUP]:-}" == nginx && "${CFG[GATEKEEPER_MODE]:-}" == local && "${CFG[GATEKEEPER_PUBLIC_URL]:-}" == https://* ]]; }
+
+px_nginx_running() { have_systemd && systemctl is-active --quiet nginx 2>/dev/null || port_in_use 443 || port_in_use 80; }
+
+# --- undo helpers -----------------------------------------------------------------------------------------
+
+
+# --- safety copy of nginx + certbot settings ---------------------------------------------------------------
+
+
+
+
+
+
+# --- DNS (Namecheap hand-holding) ---------------------------------------------------------------------------
+
+px_dns_matches() { # px_dns_matches HOST -> 0 when it resolves to this server's IPv4
+  px_dns_state "$1"
+  [[ -n "$PX_SERVER_IP4" && " $PX_DNS_A " == *" $PX_SERVER_IP4 "* ]]
+}
+
+px_dns_instructions() { # px_dns_instructions HOST
+  local host="$1" label="${1%%.*}" domain="${1#*.}"
+  say ""
+  say "  ${C_BOLD}Point $host at this server (one DNS record, at Namecheap):${C_RESET}"
+  say "    1. Log in to Namecheap, open ${C_BOLD}Domain List${C_RESET}, click ${C_BOLD}MANAGE${C_RESET} next to ${C_BOLD}$domain${C_RESET}."
+  say "    2. Open the ${C_BOLD}Advanced DNS${C_RESET} tab and click ${C_BOLD}ADD NEW RECORD${C_RESET}."
+  say "    3. Fill in exactly:"
+  say "         Type  : ${C_BOLD}A Record${C_RESET}"
+  say "         Host  : ${C_BOLD}$label${C_RESET}"
+  say "         Value : ${C_BOLD}${PX_SERVER_IP4:-<the IPv4 address of this server>}${C_RESET}"
+  say "         TTL   : Automatic"
+  say "    4. Click the green ${C_BOLD}checkmark${C_RESET} to save."
+  say "  ${C_DIM}If $domain does not use Namecheap's own nameservers (Domain tab: 'Nameservers'; for example it uses Cloudflare), add the same${C_RESET}"
+  say "  ${C_DIM}record there instead, as 'DNS only' (grey cloud). Changes normally show up within 1 to 5 minutes, sometimes up to 30.${C_RESET}"
+  say "  ${C_DIM}Do not touch any other record: your other sites keep working exactly as they do now.${C_RESET}"
+}
+
+# px_dns_wait HOST: show the instructions if needed, then wait (you press Enter to re-check) until it points here.
+px_dns_wait() {
+  local host="$1" answer tries=0
+  px_detect
+  if px_dns_matches "$host"; then ok "$host already points at this server ($PX_DNS_A): nothing to do at Namecheap"; return 0; fi
+  if [[ -z "$PX_SERVER_IP4" ]]; then
+    warn "I could not find out this server's public IPv4 address (no internet?), so I cannot check the DNS record."
+    interactive || return 1
+    confirm "Is $host already pointing at this server?" n && return 0
+    return 1
+  fi
+  px_dns_instructions "$host"
+  interactive || return 1
+  while true; do
+    tries=$((tries + 1))
+    answer="$(ask "Press Enter to check the record now (type q to stop)" "")"
+    [[ "$answer" != q && "$answer" != Q ]] || return 1
+    if px_dns_matches "$host"; then ok "$host now points at this server ($PX_DNS_A). Good."; return 0; fi
+    if [[ -z "$PX_DNS_A" && -z "$PX_DNS_AAAA" ]]; then
+      warn "$host does not resolve yet. If you just saved the record, wait a minute or two and press Enter again."
+    else
+      warn "$host currently points to ${PX_DNS_A:-$PX_DNS_AAAA}, not to this server (${PX_SERVER_IP4}). Fix the value of the record, wait a minute, press Enter."
+    fi
+    (( tries % 4 != 0 )) || px_dns_instructions "$host"
+  done
+}
+
+# --- the wizard question -------------------------------------------------------------------------------------
+
+px_describe_server() { # one-glance summary of what was found, for the question
+  px_detect
+  local host="$1"
+  if [[ -n "$PX_NGINX" ]]; then say "    nginx           : installed${PX_NGINX_VERSION:+ (version $PX_NGINX_VERSION)}, $($PX_NGINX_RUNNING && echo running || echo 'not running')"
+  else say "    nginx           : not found"; fi
+  if [[ -n "$PX_CERTBOT" ]]; then say "    certbot         : installed${PX_CERTBOT_RENEWS:+, renews through $PX_CERTBOT_RENEWS}"
+  elif [[ -n "$PX_ACMESH" ]]; then say "    acme.sh         : installed (certbot is not)"
+  else say "    certificates    : no certbot or acme.sh found"; fi
+  if px_find_cert "$host"; then say "    certificate     : one that covers $host already exists (${PX_CERT_KIND}, expires ${PX_CERT_END:-?})"
+  else say "    certificate     : none for $host yet"; fi
+}
+
+px_wizard_proxy() {
+  local host choice def=2 email
+  [[ "${CFG[GATEKEEPER_PUBLIC_URL]:-}" == https://* ]] || { CFG[PROXY_SETUP]=""; return 0; }
+  host="$(px_managed_host)"
+  say ""
+  say "${C_BOLD}The nginx site and HTTPS certificate for $host${C_RESET}   ${C_DIM}(everything here is optional)${C_RESET}"
+  say "  What I found on this server:"
+  px_describe_server "$host"
+  [[ -n "$PX_NGINX" ]] && def=1
+  say ""
+  say "  How do you want to do this?"
+  say "   ${C_BOLD}1)${C_RESET} Do it for me, with you watching. First I show every file and command and save a safety copy of your nginx and"
+  say "      certbot settings; it needs your yes; nothing existing is edited (one new site file + a certificate for $host only);"
+  say "      and everything is undone automatically if anything fails."
+  say "   ${C_BOLD}2)${C_RESET} I will do it myself: show me the exact commands for the setup you have (nothing is changed on this server)."
+  say "   ${C_BOLD}3)${C_RESET} Skip this: it is already done, or I will deal with it later."
+  while true; do
+    choice="$(ask "Your choice" "$def")"
+    case "$choice" in
+      1)
+        if [[ -z "$PX_NGINX" ]]; then
+          warn "nginx was not found on this server, so I cannot set it up for you. Choose 2 for the exact steps for your web server."
+          continue
+        fi
+        if [[ -n "$PX_ACMESH" && -z "$PX_CERTBOT" ]] && ! px_find_cert "$host"; then
+          warn "Your certificates are managed by acme.sh. I only automate certbot, and I will not mix the two. Choose 2 for the exact acme.sh commands."
+          continue
+        fi
+        if ! px_dns_wait "$host"; then
+          say "  Stopped before changing anything. Choose again, or create the DNS record and run the installer again."
+          continue
+        fi
+        email="$(ask "E-mail for Let's Encrypt expiry notices (recommended; Enter to skip)" "${CFG[ACME_EMAIL]:-}")"
+        if [[ -n "$email" ]] && ! is_email "$email"; then warn "That does not look like an e-mail address; leaving it empty."; email=""; fi
+        CFG[ACME_EMAIL]="$email"
+        CFG[PROXY_SETUP]=nginx
+        return 0
+        ;;
+      2) CFG[PROXY_SETUP]=manual; return 0 ;;
+      3) CFG[PROXY_SETUP]=""; return 0 ;;
+      *) warn "Please type 1, 2 or 3." ;;
+    esac
+  done
+}
+
+# --- preflight (read-only): can the managed setup be done safely? ---------------------------------------------
+
+# Prints why the managed setup cannot be done; always returns 0 (callers return 1 themselves), so it is safe under set -e.
+px_refuse() {
+  err "$1"; shift
+  local l
+  for l in "$@"; do say "  $l"; done
+  say "  ${C_BOLD}Nothing was changed.${C_RESET} You can also choose the do-it-yourself path (gatekeeper proxy-help) or skip it."
+  return 0
+}
+
+px_decide_proxy() {
+  P_PROXY=false; P_PROXY_CERT=""; P_PROXY_CERT_DIR=""; P_PROXY_RENEW_JOB=false; P_PROXY_CERTBOT_PKG=false
+  px_managed || return 0
+  local host ha_host file out
+  host="$(px_managed_host)"; PX_HOST="$host"
+  ha_host="$(url_host "${CFG[HA_BASE_URL]:-}" 2>/dev/null || true)"
+  px_detect
+
+  [[ "$EUID" -eq 0 ]] || { px_refuse "Setting up nginx and the certificate needs root. Run the installer with sudo."; return 1; }
+  is_domain "$host" || { px_refuse "'$host' is not a valid name for a certificate."; return 1; }
+  [[ "$host" != "$ha_host" ]] || { px_refuse "$host is the address of your Home Assistant. Gatekeeper needs its own new name."; return 1; }
+  [[ -n "$PX_NGINX" ]] || { px_refuse "nginx was not found on this server."; return 1; }
+
+  if ! out="$("$PX_NGINX" -t 2>&1)"; then
+    px_refuse "nginx's configuration has an error RIGHT NOW, before I have touched anything:" "$(sed 's/^/    /' <<<"$out" | head -n 8)" \
+      "I will not add to a configuration that does not pass its own test. Fix that first: sudo nginx -t"
+    return 1
+  fi
+
+  if ! px_dns_matches "$host"; then
+    px_refuse "$host does not point at this server yet (DNS says: ${PX_DNS_A:-nothing}; this server is ${PX_SERVER_IP4:-unknown}). Let's Encrypt would fail."
+    px_dns_instructions "$host"
+    return 1
+  fi
+
+  P_PROXY_SITE="$(px_site_path "$host")"
+  [[ "$PX_NGINX_STYLE" == confd ]] && P_PROXY_LINK="" || P_PROXY_LINK="$PX_NGINX_DIR/sites-enabled/$host"
+  if file="$(px_nginx_has_host "$host")"; then
+    if [[ -f "$file" ]] && grep -qF "Managed by the HA Gatekeeper installer" "$file"; then
+      : # our own file from an earlier run: re-applying is safe and idempotent
+    else
+      px_refuse "nginx already has a server block for $host in $file, written by someone else." "I never edit existing sites. Choose another name, or use the do-it-yourself path."
+      return 1
+    fi
+  fi
+  if [[ -e "$P_PROXY_SITE" ]] && ! grep -qF "Managed by the HA Gatekeeper installer" "$P_PROXY_SITE" 2>/dev/null; then
+    px_refuse "$P_PROXY_SITE already exists and is not mine. I never overwrite files I did not create."
+    return 1
+  fi
+  if [[ -n "$P_PROXY_LINK" && ( -e "$P_PROXY_LINK" || -L "$P_PROXY_LINK" ) ]] && ! grep -qF "Managed by the HA Gatekeeper installer" "$P_PROXY_LINK" 2>/dev/null; then
+    px_refuse "$P_PROXY_LINK already exists and is not mine."
+    return 1
+  fi
+
+  if px_find_cert "$host"; then
+    P_PROXY_CERT=reuse; P_PROXY_CERT_DIR="$PX_CERT_DIR"
+  else
+    P_PROXY_CERT=issue; P_PROXY_CERT_DIR="$PX_LE_DIR/live/$host"
+    if [[ -z "$PX_CERTBOT" ]]; then
+      if [[ "$PKG" == apt ]]; then P_PROXY_CERTBOT_PKG=true
+      else px_refuse "certbot is not installed and I can only install it with apt on this system." "Install certbot yourself, or use the do-it-yourself path."; return 1; fi
+    elif [[ -z "$PX_CERTBOT_RENEWS" && ! -e "$(px_renew_timer_path)" && ! -e "$(px_renew_cron_path)" ]]; then
+      P_PROXY_RENEW_JOB=true
+    fi
+  fi
+  P_PROXY=true
+  return 0
+}
+
+# --- the plan (exact changes, shown before anything is done) -------------------------------------------------
+
+px_plan_proxy() {
+  $P_PROXY || return 0
+  local host="$PX_HOST" backup_hint
+  backup_hint="$APP_DIR/backups/web-config-<time>.tar.gz"
+  PLAN_SYSTEM+=("FIRST, a safety copy of your web settings: $PX_NGINX_DIR (all nginx config), $PX_LE_DIR (certificates, keys, renewal settings) and certbot's timer files, saved as $backup_hint (root-only, kept forever; put back with: sudo gatekeeper web-restore)")
+  PLAN_SYSTEM+=("Create the folder $PX_WEBROOT (only for Let's Encrypt challenge files; your /var/www/html is not used)")
+  PLAN_SYSTEM+=("Create ONE new nginx site file $P_PROXY_SITE for the name $host only (exact content below)${P_PROXY_LINK:+, and the link $P_PROXY_LINK that switches it on}")
+  PLAN_SYSTEM+=("Check nginx with 'nginx -t' before EVERY reload; if the test fails nothing is reloaded and everything is undone. Then reload nginx (a reload keeps all your sites up; it is not a restart)")
+  if [[ "$P_PROXY_CERT" == issue ]]; then
+    $P_PROXY_CERTBOT_PKG && PLAN_SOFTWARE+=("Install certbot with apt (Let's Encrypt's own client; it also installs its own automatic renewal timer)")
+    PLAN_SYSTEM+=("Get a Let's Encrypt certificate for $host ONLY: first a rehearsal ('certbot certonly --dry-run' on Let's Encrypt's practice server), then the real 'certbot certonly --webroot -w $PX_WEBROOT -d $host --cert-name $host'. This adds ${PX_LE_DIR}/live/$host, archive/$host and renewal/$host.conf; no other certificate is touched")
+    PLAN_SYSTEM+=("Renewal: the certificate renews itself with a reload of nginx afterwards (a --deploy-hook saved in renewal/$host.conf)")
+    if $P_PROXY_RENEW_JOB; then
+      PLAN_SYSTEM+=("Your server has no automatic certbot renewal, so I add a small job just for this one certificate: $(px_renew_timer_path) (twice a day: 'certbot renew --cert-name $host'); it touches no other certificate")
+    elif $P_PROXY_CERTBOT_PKG; then
+      PLAN_SYSTEM+=("Renewal job: certbot's own timer (installed with the package) renews every certificate on this server; I verify it with a rehearsal")
+    else
+      PLAN_SYSTEM+=("Renewal job: your existing automatic certbot renewal (${PX_CERTBOT_RENEWS}) will renew this certificate too; I verify it with a rehearsal ('certbot renew --dry-run --cert-name $host')")
+    fi
+  else
+    PLAN_SYSTEM+=("Certificate: a certificate that already covers $host exists in $P_PROXY_CERT_DIR (${PX_CERT_KIND}); it is used as it is. Nothing is issued and its renewal is not touched")
+  fi
+  PLAN_NETWORK+=("nginx keeps serving ports 80 and 443; the new name $host is added to it. No firewall change, no port change")
+  PLAN_KEEP+=("Every existing nginx site and certificate: not edited. The nginx and certbot settings are copied first, and nginx's own test must pass before and after")
+}
+
+px_print_plan_files() {
+  $P_PROXY || return 0
+  local host="$PX_HOST" port="${CFG[GATEKEEPER_PORT]:-8080}"
+  say "${C_BOLD}The exact nginx file that will be created: $P_PROXY_SITE${C_RESET}"
+  say "  ${C_DIM}(first only its port-80 half is installed so Let's Encrypt can check the name; then this complete file replaces it)${C_RESET}"
+  PX_MANAGED=true; PX_ACME_ROOT="$PX_WEBROOT"; px_detect
+  px_https_block "$host" "$P_PROXY_CERT_DIR" "$port" | px_file
+  PX_MANAGED=false; PX_ACME_ROOT="/var/www/html"
+  say ""
+  say "${C_BOLD}The exact commands that will run${C_RESET} ${C_DIM}(as root, in this order)${C_RESET}"
+  say "      tar ... $PX_NGINX_DIR $PX_LE_DIR ...          ${C_DIM}# the safety copy${C_RESET}"
+  say "      nginx -t && systemctl reload nginx            ${C_DIM}# after adding the port-80 half${C_RESET}"
+  if [[ "$P_PROXY_CERT" == issue ]]; then
+    say "      certbot certonly --webroot -w $PX_WEBROOT -d $host --cert-name $host --dry-run ..."
+    say "      certbot certonly --webroot -w $PX_WEBROOT -d $host --cert-name $host --deploy-hook 'nginx -t -q && systemctl reload nginx' ..."
+  fi
+  say "      nginx -t && systemctl reload nginx            ${C_DIM}# after the complete file is in place${C_RESET}"
+  say "  ${C_BOLD}To undo it all later:${C_RESET} sudo gatekeeper uninstall (removes only what is listed above), or restore the safety copy with sudo gatekeeper web-restore."
+  say ""
+}
+
+# --- apply ---------------------------------------------------------------------------------------------------

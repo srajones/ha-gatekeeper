@@ -1,71 +1,95 @@
 # Putting Gatekeeper on its own subdomain (nginx + Let's Encrypt you already run)
 
-This is for a server that **already** runs nginx with certbot (or acme.sh) for other sites. The installer's option 3
-("private, behind my own web server") leaves Gatekeeper listening on `127.0.0.1:8080` only; nginx is the front door.
-
-**Nothing here is automatic.** The installer never reads, edits or reloads your nginx or your certificates, and neither
-helper command below changes anything either. You run every command yourself and see it first.
+For a server that **already** runs nginx (and certbot or acme.sh) for other sites. In the installer choose **option 3**
+("private, behind my own web server") and enter the new name, for example `gatekeeper.epicfury4d.live`.
+Then the installer asks one optional question and **you choose how much it does**:
 
 ```text
-sudo gatekeeper proxy-help [name]    a long step-by-step guide for your server, with the exact commands
-sudo gatekeeper proxy-check [name]   tests the finished setup from every angle and says what to fix
+1) Do it for me, with you watching   (every file and command shown first, safety copy, automatic undo)
+2) I will do it myself               (prints the exact commands for the setup it found; changes nothing)
+3) Skip this                         (already done, or later)
 ```
 
-Run them with `sudo` so they can read nginx's configuration and `.env`. Both are safe to run as often as you like.
+Everything is optional. Nothing is changed on this server until you have seen the complete plan and said yes.
 
-## What `proxy-help` does
+## Choice 1: "Do it for me" step by step
 
-1. **Looks** (read-only): is nginx there and which version, how site files are organised (`sites-enabled` or
-   `conf.d`), whether certbot/acme.sh exist, whether renewal is automatic, whether a certificate already covers the new
-   name (including wildcards), whether nginx already has a server block for it.
-2. **Suggests a safety copy** of `/etc/nginx` and `/etc/letsencrypt` (root-only, one command).
-3. **DNS**: the exact record to create, the server's IP, and whether the name already points at this server. Notes for
-   Cloudflare (use the grey cloud until the certificate is issued) and stray IPv6 records.
-4. **Ports** 80/443: how to check ufw and your hosting provider's firewall.
-5. **Certificate**: only for the new name, never touching existing ones. It prints a port-80-only nginx file first (so
-   Let's Encrypt can prove ownership), then the commands: a `--dry-run` rehearsal, then the real
-   `certbot certonly ...`. `certonly` fetches a certificate and edits no nginx file. If a wildcard certificate already
-   covers the name, this step is skipped.
-6. **The finished site file** (HTTP redirects to HTTPS, HTTPS forwards to Gatekeeper). It adds no `http2`,
-   `default_server` or `ipv6only` options, so it cannot change how your other sites listen. IPv6 `listen` lines appear
-   only if your nginx already uses IPv6.
-7. **Gatekeeper's own settings** (public address, one trusted proxy) and **how to test and undo**.
+1. **DNS first, with Namecheap hand-holding.** It tells you exactly what to click:
+   *Domain List → MANAGE → Advanced DNS → ADD NEW RECORD*, type **A Record**, host = the first part of your name
+   (for `gk.epicfury4d.live` that is `gk`), value = this server's IPv4 address (it prints it), TTL Automatic, then
+   the green checkmark. It then waits: press Enter to re-check as often as you like (`q` stops, nothing changed).
+   If the domain does not use Namecheap's nameservers it says to add the record where the DNS really lives.
+2. **Pre-checks (read-only).** It refuses, changing nothing, when: `nginx -t` already fails (it will not add to a broken
+   configuration), the name does not point here yet, the name is your Home Assistant's, nginx already has a server
+   block for the name that is not the installer's, a file with that name is not the installer's, or certbot is
+   missing on a system without apt.
+3. **The complete plan** lists every file and command, then prints **the exact nginx file** that will be created and the
+   exact commands that will run. Default answer is No.
+4. **A safety copy first.** `/etc/nginx`, `/etc/letsencrypt` (certificates, keys, renewal settings) and certbot's
+   timer files are saved as one root-only file, `<install dir>/backups/web-config-<time>.tar.gz`. It is verified,
+   never overwritten, never deleted automatically and kept even when the install is undone.
+5. **Apply**, each step journaled for undo:
+   - a folder `/var/www/ha-gatekeeper-acme` (only for challenge files; your `/var/www/html` is not used);
+   - ONE new site file for the new name (port 80 only first), enabled with a link;
+   - `nginx -t`; only if it passes, a reload (a reload keeps all your sites up). It is never reloaded after a failing test;
+   - the certificate for **this name only**: first `certbot certonly --dry-run` on Let's Encrypt's practice server (a
+     typo cannot use up your weekly limit), then the real `certbot certonly --webroot ... --cert-name <name>` with
+     a `--deploy-hook` that reloads nginx after every renewal. No other certificate is touched;
+   - the complete site file (HTTP redirects to HTTPS, HTTPS forwards to Gatekeeper), `nginx -t`, reload.
+6. **Auto-renewal for just that certificate.** If your server already renews certbot certificates (systemd timer or
+   cron) that job renews this one too; the installer then proves it with `certbot renew --dry-run --cert-name <name>`.
+   If the server has no renewal job at all, it adds a small one for only this certificate (twice a day).
+7. **Verification** (also available later as `sudo gatekeeper proxy-check`): DNS, certificate name and expiry, the
+   whole trip browser → nginx → Gatekeeper, login and the secure cookie, Gatekeeper's address settings, and renewal.
+   A failure undoes the file changes automatically.
 
-The two ready-to-copy files are written to `<install dir>/proxy/` (inside Gatekeeper's own folder) so you can
-`sudo cp` them. That folder is the only place the command writes.
+### What the generated nginx file never does
 
-## Why your existing setup stays safe
+It never edits an existing file, never sets `http2`, `default_server` or `ipv6only` (which could change how your other
+sites listen), and only adds IPv6 `listen` lines if your nginx already uses IPv6.
 
-- It never runs `certbot` at all (not even `certbot plugins`, which writes logs and takes locks). The nginx plugin is
-  detected by looking at files.
-- It runs only read-only commands: `nginx -v`, `nginx -T` (prints the configuration), `systemctl is-active/is-enabled`,
-  `ufw status`, `dpkg-query -W`, DNS lookups, TLS handshakes and HTTP requests to your own names.
-- The step-by-step commands you run use `nginx -t` **before** every reload and tell you to stop if it does not say
-  `syntax is ok` and `test is successful`. A reload keeps all existing connections and sites up.
-- A test suite (`deploy/tests/proxy.test.sh`) replaces nginx, certbot, systemctl, ufw and docker with stubs that log
-  every call. It fails if any call is not on the read-only list, if the fake `/etc/nginx` or `/etc/letsencrypt` trees
-  change by even one byte, and if the script source contains a mutating command or a write outside its own folder.
-- The generated files were also checked with a real nginx 1.24 (Ubuntu 24.04): `nginx -t` passes, an existing site on
-  the same ports keeps answering, and `proxy-check` passes end to end (see below).
+### If something goes wrong
 
-## What `proxy-check` tests
-
-| # | Test | If it fails it tells you |
-|---|------|--------------------------|
-| 1 | Gatekeeper answers on `127.0.0.1:8080` | `gatekeeper status` / `logs` |
-| 2 | DNS: the name resolves to this server; no wrong AAAA record | the record to create/fix |
-| 3 | nginx listens on 443; the certificate it presents covers the name, is not expired, days left | `server_name` / reload hints |
-| 4 | `https://name/healthz` through nginx to Gatekeeper (chain, name, forwarding); the same over the real internet route; http redirects to https; dashboard loads | 502 = wrong `proxy_pass`; 404/other cert = another site answers |
-| 5 | Login through the proxy; cookie is `Secure` and `HttpOnly`; stays logged in on the next request | `X-Forwarded-Proto`, `TRUST_PROXY`, public address |
-| 6 | Gatekeeper's public address equals the name; one trusted proxy | `gatekeeper install --reconfigure` |
-| 7 | Renewal is automatic (certbot timer/cron or acme.sh) | `certbot renew --dry-run` |
-
-Exit status is 0 when nothing failed (warnings are allowed) and 1 when something failed.
-
-## Undo
+The undo removes the new files and link and challenge folder, reloads nginx (only after `nginx -t` passes) and prints
+what it did. **The new certificate is kept on purpose** (re-issuing it repeatedly can hit Let's Encrypt's weekly
+limits; a retry reuses it); the undo prints the one command that deletes it. The safety copy is kept as well.
 
 ```text
-sudo rm /etc/nginx/sites-available/<name> /etc/nginx/sites-enabled/<name>   (or the conf.d file)
-sudo nginx -t && sudo systemctl reload nginx
-sudo certbot delete --cert-name <name>                                       (optional)
+sudo gatekeeper web-backup           save a safety copy of your nginx and certbot settings right now (changes nothing)
+sudo gatekeeper web-restore [FILE]   put a saved copy back; takes a fresh copy of the current state first, asks first,
+                                     refuses any file that is not a safety copy, runs nginx -t afterwards
+sudo gatekeeper uninstall            removes only what the installer created (files that carry its marker comment),
+                                     asks before deleting the certificate
 ```
+
+## Choice 2: "I will do it myself"
+
+After the install it prints a long guide **built from what it detected** on your server: whether nginx uses
+`sites-enabled` or `conf.d`, the nginx version, which certbot/acme.sh exists and whether it renews, any existing or
+wildcard certificate that already covers the name (it then skips issuing), the server's IP, the current DNS answer, and
+the ready-to-copy files (written to `<install dir>/proxy/`). The same guide is available any time:
+
+```text
+sudo gatekeeper proxy-help [name]    the guide; read-only
+sudo gatekeeper proxy-check [name]   tests the finished setup and says what to fix; read-only
+```
+
+`proxy-help` and `proxy-check` never run certbot and only run read-only commands (`nginx -v`, `nginx -T`,
+`systemctl is-active/is-enabled`, `ufw status`, DNS lookups, TLS handshakes, HTTP requests to your own names).
+
+## The tests behind this
+
+- `deploy/tests/proxy.test.sh` (read-only guide and checks) stubs nginx, certbot, systemctl, ufw and docker with
+  logging stubs and fails on any call that is not read-only, any change to the fake `/etc/nginx` or `/etc/letsencrypt`,
+  or any mutating command / write outside its own folder in `deploy/proxy.sh`.
+- `deploy/tests/proxy-apply.test.sh` (the managed setup) covers every refusal, the plan, the safety copy (including
+  two copies in the same second), apply, idempotent re-run, rollback after each kind of failure (nginx rejects the
+  file, rehearsal fails, real request fails, a later health-check failure), the certificate-kept behaviour and the
+  retry that reuses it, the renewal job, restore (and refusing a hostile tar), uninstall (only files with the
+  marker), the wizard and the DNS wait, and that **nginx is only ever reloaded right after a passing `nginx -t`**.
+  After each failure the fake nginx and certbot trees are byte-identical to before (apart from the kept certificate).
+- The generated files and the whole flow were also run against a real nginx 1.24 (Ubuntu 24.04): `nginx -t` passes,
+  an existing site on the same ports kept answering, apply, uninstall and a forced failure after the certificate
+  restored the real `/etc/nginx` byte for byte, and `proxy-check` passed all 17 checks (login through the proxy,
+  Secure cookie, renewal rehearsal). The certificate authority was a stand-in: a real Let's Encrypt issuance needs a
+  real public domain and has not been run by the developer.
