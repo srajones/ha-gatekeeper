@@ -125,6 +125,8 @@ run_case() { # run_case NAME 'bash code' ; output -> $OUT
   (
     export PATH="$SHIM:$PATH" FAKE GK_SOURCE_ONLY=1 GK_LOG_FILE=/dev/null GK_LETSENCRYPT_DIR="$LE" GK_NGINX_DIR="$NG" \
       FAKE_NGINX_DIR="$NG" GK_PX_SERVER_IP4=203.0.113.7 GK_PX_SERVER_IP6="" HOME="$ROOT/home"
+    # never look at the host's real certbot, renewal cron file or nginx plugin: only the stubs and the fake trees count
+    export GK_CERTBOT_BIN="$SHIM/certbot" GK_CERTBOT_CRON="$ROOT/no-certbot-cron" GK_CERTBOT_PLUGIN_SCAN=stub GK_NGINX_BIN="$SHIM/nginx"
     export NO_COLOR=1
     # shellcheck source=/dev/null
     source "$REPO/install.sh"

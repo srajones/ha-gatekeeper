@@ -59,6 +59,10 @@ PX_CERT_DIR=""; PX_CERT_NAMES=""; PX_CERT_END=""; PX_CERT_KIND=""
 # True if the certbot nginx plugin is installed (apt package, snap, or pip), found by looking at files only.
 px_certbot_nginx_plugin_present() {
   local d
+  if [[ "${GK_CERTBOT_PLUGIN_SCAN:-}" == stub ]]; then   # test hook: only the stubbed package query counts
+    have dpkg-query && dpkg-query -W -f='${Status}' python3-certbot-nginx 2>/dev/null | grep -q 'install ok installed'
+    return
+  fi
   for d in /usr/lib/python3/dist-packages /usr/lib/python3*/site-packages /usr/local/lib/python3*/dist-packages /usr/local/lib/python3*/site-packages /snap/certbot/current/lib/python3*/site-packages; do
     # shellcheck disable=SC2086
     compgen -G "$d/certbot_nginx" >/dev/null 2>&1 && return 0
@@ -96,15 +100,17 @@ px_detect() {
   elif [[ -d "$PX_NGINX_DIR/conf.d" ]]; then PX_NGINX_STYLE=confd; fi
 
   PX_CERTBOT=""; PX_CERTBOT_NGINX=false; PX_CERTBOT_RENEWS=""
-  if have certbot; then PX_CERTBOT="$(command -v certbot)"
+  if [[ -n "${GK_CERTBOT_BIN+x}" ]]; then
+    [[ -x "$GK_CERTBOT_BIN" ]] && PX_CERTBOT="$GK_CERTBOT_BIN"   # test hook: a fixed (or missing) certbot binary
+  elif have certbot; then PX_CERTBOT="$(command -v certbot)"
   elif [[ -x /snap/bin/certbot ]]; then PX_CERTBOT=/snap/bin/certbot; fi
   if [[ -n "$PX_CERTBOT" ]]; then
     # Looked up on disk, never by running certbot: even `certbot plugins` writes logs and takes locks under /var/lib/letsencrypt.
     if px_certbot_nginx_plugin_present; then PX_CERTBOT_NGINX=true; fi
     if have systemctl && { systemctl is-enabled --quiet certbot.timer 2>/dev/null || systemctl is-enabled --quiet snap.certbot.renew.timer 2>/dev/null; }; then
       PX_CERTBOT_RENEWS="a systemd timer"
-    elif [[ -f /etc/cron.d/certbot ]] && grep -q 'certbot' /etc/cron.d/certbot 2>/dev/null; then
-      PX_CERTBOT_RENEWS="a cron job (/etc/cron.d/certbot)"
+    elif [[ -f "${GK_CERTBOT_CRON:-/etc/cron.d/certbot}" ]] && grep -q 'certbot' "${GK_CERTBOT_CRON:-/etc/cron.d/certbot}" 2>/dev/null; then
+      PX_CERTBOT_RENEWS="a cron job (${GK_CERTBOT_CRON:-/etc/cron.d/certbot})"
     fi
   fi
 
@@ -350,8 +356,15 @@ px_write_files() { # px_write_files HOST CERTDIR PORT -> writes <app>/proxy/HOST
 # gatekeeper proxy-help
 # ---------------------------------------------------------------------------------------------
 
+# The read-only commands (proxy-help, proxy-check) must work on a server that is not set up yet: use .env when it exists,
+# otherwise the defaults (the name then comes from the command line).
+px_load_config_lenient() {
+  if [[ -f "$APP_DIR/.env" ]]; then load_runtime_config
+  else cfg_defaults; derive_config; fi
+}
+
 cmd_proxy_help() {
-  load_runtime_config
+  px_load_config_lenient
   local host port have_cert=false site enabled certdir dir existing_file
   port="${CFG[GATEKEEPER_PORT]:-8080}"
 
@@ -774,7 +787,7 @@ px_checks() {
 }
 
 cmd_proxy_check() {
-  load_runtime_config
+  px_load_config_lenient
   local host base
   host="$(px_choose_host "${COMMAND_ARGS[0]:-${CFG[GATEKEEPER_PUBLIC_URL]:+$(url_host "${CFG[GATEKEEPER_PUBLIC_URL]}")}}")" || return 1
   base="https://$host"
@@ -879,7 +892,9 @@ px_dns_wait() {
   interactive || return 1
   while true; do
     tries=$((tries + 1))
-    answer="$(ask "Press Enter to check the record now (type q to stop)" "")"
+    # Never wait forever: a closed terminal (end of input) or a very long wait ends this, so the install lock is released.
+    if (( tries > 300 )); then warn "Giving up waiting for the DNS record. Nothing was changed."; return 1; fi
+    answer="$(ask_or_quit "Press Enter to check the record now (type q to stop)" "")" || { warn "The terminal was closed while waiting. Nothing was changed."; return 1; }
     [[ "$answer" != q && "$answer" != Q ]] || return 1
     if px_dns_matches "$host"; then ok "$host now points at this server ($PX_DNS_A). Good."; return 0; fi
     if [[ -z "$PX_DNS_A" && -z "$PX_DNS_AAAA" ]]; then
@@ -922,7 +937,7 @@ px_wizard_proxy() {
   say "   ${C_BOLD}2)${C_RESET} I will do it myself: show me the exact commands for the setup you have (nothing is changed on this server)."
   say "   ${C_BOLD}3)${C_RESET} Skip this: it is already done, or I will deal with it later."
   while true; do
-    choice="$(ask "Your choice" "$def")"
+    choice="$(ask_or_quit "Your choice" "$def")" || die "The terminal was closed while waiting for an answer. Nothing was changed."
     case "$choice" in
       1)
         if [[ -z "$PX_NGINX" ]]; then
@@ -937,7 +952,7 @@ px_wizard_proxy() {
           say "  Stopped before changing anything. Choose again, or create the DNS record and run the installer again."
           continue
         fi
-        email="$(ask "E-mail for Let's Encrypt expiry notices (recommended; Enter to skip)" "${CFG[ACME_EMAIL]:-}")"
+        email="$(ask_or_quit "E-mail for Let's Encrypt expiry notices (recommended; Enter to skip)" "${CFG[ACME_EMAIL]:-}")" || die "The terminal was closed while waiting for an answer. Nothing was changed."
         if [[ -n "$email" ]] && ! is_email "$email"; then warn "That does not look like an e-mail address; leaving it empty."; email=""; fi
         CFG[ACME_EMAIL]="$email"
         CFG[PROXY_SETUP]=nginx

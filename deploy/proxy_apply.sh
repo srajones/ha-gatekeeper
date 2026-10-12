@@ -32,15 +32,19 @@ rv_backup_note() {
   RV_NOTE="Kept on purpose. Put everything back with: sudo gatekeeper web-restore $1"
   return 2
 }
+px_certbot_cron_path() { printf '%s' "${GK_CERTBOT_CRON:-/etc/cron.d/certbot}"; }
+px_systemd_dir() { printf '%s' "${SYSTEMD_DIR:-/etc/systemd/system}"; }
+
 px_web_backup_sources() { # existing paths worth saving
-  local p
-  for p in "$PX_NGINX_DIR" "$PX_LE_DIR" /etc/cron.d/certbot /etc/systemd/system/certbot.service /etc/systemd/system/certbot.timer \
-    /etc/systemd/system/certbot.service.d /etc/systemd/system/certbot.timer.d /etc/systemd/system/snap.certbot.renew.service \
-    /etc/systemd/system/snap.certbot.renew.timer; do
+  local p sd
+  sd="$(px_systemd_dir)"
+  for p in "$PX_NGINX_DIR" "$PX_LE_DIR" "$(px_certbot_cron_path)" "$sd/certbot.service" "$sd/certbot.timer" \
+    "$sd/certbot.service.d" "$sd/certbot.timer.d" "$sd/snap.certbot.renew.service" "$sd/snap.certbot.renew.timer"; do
     [[ -e "$p" ]] && printf '%s\n' "$p"
   done
   return 0
 }
+
 # px_web_backup -> creates $APP_DIR/backups/web-config-TIMESTAMP.tar.gz (root-only), verifies it, prints its path.
 # Contains Let's Encrypt private keys, so it is mode 600 inside the root-only backups folder. Never deleted automatically.
 px_web_backup() {
@@ -88,14 +92,16 @@ cmd_web_backup() {
 }
 # Paths a restore may write: exactly the ones a backup holds, never anything else.
 px_restore_allowed() {
-  local p="$1"
+  local p="$1" sd
+  sd="$(px_systemd_dir)"
   [[ "$p" != *..* ]] || return 1
   case "$p" in
     "$PX_NGINX_DIR"|"$PX_NGINX_DIR"/*|"$PX_LE_DIR"|"$PX_LE_DIR"/*) return 0 ;;
-    /etc/cron.d/certbot|/etc/systemd/system/certbot.*|/etc/systemd/system/snap.certbot.renew.*) return 0 ;;
+    "$(px_certbot_cron_path)"|"$sd"/certbot.*|"$sd"/snap.certbot.renew.*) return 0 ;;
   esac
   return 1
 }
+
 cmd_web_restore() {
   local file="${COMMAND_ARGS[0]:-}" m n bad=0 safety
   if [[ -z "$file" ]]; then
@@ -118,6 +124,9 @@ cmd_web_restore() {
   say "  From: $file   ($n files and folders)"
   say "  This overwrites those files with the saved versions. Files created AFTER the backup (for example a new site) stay where they are;"
   say "  to remove those, delete them yourself. I first take a fresh safety copy of the CURRENT state, so this restore can be undone too."
+  if ! interactive && ! $ASSUME_YES; then
+    say "  There is no terminal to ask on. To approve this restore without one, add --yes:  gatekeeper web-restore --yes $file"
+  fi
   confirm_cmd "Restore the saved settings now?" n || die "Cancelled. Nothing was changed."
   safety="$(px_web_backup)" || die "Could not take the safety copy of the current state, so I did not restore anything."
   ok "Current state saved first: $safety"

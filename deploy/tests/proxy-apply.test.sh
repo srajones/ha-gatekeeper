@@ -103,6 +103,8 @@ run_case() { # run_case 'body'   (output in $OUT, status in $RC)
     export GK_CRON_FILE="$T/cron.d/ha-gatekeeper" GK_BIN_LINK="$T/bin/gatekeeper" GK_WATCHDOG_LOG="$T/watchdog.log"
     export GK_NGINX_DIR="$T/nginx" GK_LETSENCRYPT_DIR="$T/le" GK_ACME_WEBROOT="$T/acme" GK_CERT_RENEW_CRON="$T/cron.d/ha-gatekeeper-cert-renew"
     export GK_PX_SERVER_IP4=203.0.113.7 GK_PX_SERVER_IP6= NO_COLOR=1 HOME="$T/home"
+    # never look at the host's real certbot, renewal cron file or nginx plugin: only the stubs and the fake trees count
+    export GK_CERTBOT_BIN="$SHIM/certbot" GK_CERTBOT_CRON="$T/cron.d/certbot" GK_CERTBOT_PLUGIN_SCAN=stub GK_NGINX_BIN="$SHIM/nginx"
     # shellcheck disable=SC1091
     source "$REPO/install.sh"
     set -Eeuo pipefail
@@ -176,9 +178,8 @@ mkdir -p "$T/le/live/wild"; openssl req -x509 -newkey rsa:2048 -nodes -keyout "$
 run_case 'px_decide_proxy; echo "RESULT cert=$P_PROXY_CERT dir=$P_PROXY_CERT_DIR job=$P_PROXY_RENEW_JOB"'
 ck "a wildcard certificate that covers the name is reused" out_has "RESULT cert=reuse dir=$T/le/live/wild job=false"
 
-new_world dec4; mv "$SHIM/certbot" "$SHIM/certbot.off"
-run_case 'px_decide_proxy; echo "RESULT cert=$P_PROXY_CERT pkg=$P_PROXY_CERTBOT_PKG"'
-mv "$SHIM/certbot.off" "$SHIM/certbot"
+new_world dec4
+run_case 'export GK_CERTBOT_BIN=/nonexistent/certbot; px_decide_proxy; echo "RESULT cert=$P_PROXY_CERT pkg=$P_PROXY_CERTBOT_PKG"'
 ck "certbot missing on apt systems: it is planned as a package (never silently)" out_has "RESULT cert=issue pkg=true"
 
 # ======================================================================================================= plan
@@ -227,7 +228,7 @@ echo "the wizard question (scripted answers)"
 wiz() { # wiz "answer1|answer2|..."  -> runs px_wizard_proxy with those answers
   printf '%s\n' "${1//|/$'\n'}" >"$T/answers"
   run_case 'interactive() { return 0; }
-    ask() { local f="$T/answers"; [[ -s "$f" ]] || { echo OUT_OF_ANSWERS >&2; exit 99; }; head -n 1 "$f"; sed -i 1d "$f"; }
+    ask_or_quit() { local f="$T/answers"; [[ -s "$f" ]] || return 1; head -n 1 "$f"; sed -i 1d "$f"; }
     px_wizard_proxy; echo "RESULT setup=${CFG[PROXY_SETUP]} email=${CFG[ACME_EMAIL]}"'
 }
 new_world wz1; wiz "1|me@example.com"
@@ -240,7 +241,7 @@ new_world wz3; wiz "3"
 ck "choice 3: skip" out_has "RESULT setup= email="
 new_world wz4; wiz "9|3"
 ck "an invalid answer asks again" bash -c "grep -q 'Please type 1, 2 or 3' '$OUT' && grep -q 'RESULT setup= ' '$OUT'"
-new_world wz5; mv "$SHIM/nginx" "$SHIM/nginx.off"; export GK_NGINX_BIN=/nonexistent/nginx; wiz "1|2"; unset GK_NGINX_BIN; mv "$SHIM/nginx.off" "$SHIM/nginx"
+new_world wz5; mv "$SHIM/nginx" "$SHIM/nginx.off"; wiz "1|2"; mv "$SHIM/nginx.off" "$SHIM/nginx"
 ck "choice 1 without nginx is refused (and offers the manual path)" bash -c "grep -q 'nginx was not found on this server' '$OUT' && grep -q 'RESULT setup=manual' '$OUT'"
 new_world wz6; printf 'gk.example.com 198.51.100.9\n' >"$FAKE/dns4"; wiz "1|q|3"
 ck "DNS wrong: shows the Namecheap steps and lets you stop (q) and choose again" bash -c "grep -q 'Advanced DNS' '$OUT' && grep -q 'RESULT setup= ' '$OUT'"
@@ -250,12 +251,51 @@ cat >"$T/wz7.sh" <<'WZEOF'
 interactive() { return 0; }
 echo 0 >"$T/n"
 px_dns_matches() { local n; n=$(( $(cat "$T/n") + 1 )); echo "$n" >"$T/n"; PX_DNS_A="198.51.100.9"; (( n >= 3 )); }
-ask() { local f="$T/answers"; [[ -s "$f" ]] || { echo OUT_OF_ANSWERS >&2; exit 99; }; head -n 1 "$f"; sed -i 1d "$f"; }
+ask_or_quit() { local f="$T/answers"; [[ -s "$f" ]] || return 1; head -n 1 "$f"; sed -i 1d "$f"; }
 px_dns_wait gk.example.com && echo DNS_OK
 WZEOF
 run_case "source '$T/wz7.sh'"
 ck "waiting for DNS: press Enter to re-check until it points here" bash -c "grep -q 'DNS_OK' '$OUT' && grep -q 'now points at this server' '$OUT'"
 ck "a wrong value is explained" out_has "not to this server (203.0.113.7)"
+
+echo "a closed terminal never leaves the installer waiting (and holding the lock)"
+new_world eof1
+run_case 'ask_or_quit() { return 1; }; interactive() { return 0; }; px_wizard_proxy; echo SHOULD_NOT_REACH'
+ck "the wizard question ends with a clear message when the terminal is gone" bash -c "grep -q 'The terminal was closed while waiting' '$OUT' && ! grep -q SHOULD_NOT_REACH '$OUT'"
+t "...and the process exits (does not spin)" 1 "$RC"
+new_world eof2; printf 'gk.example.com 198.51.100.9\n' >"$FAKE/dns4"
+run_case 'ask_or_quit() { return 1; }; interactive() { return 0; }; px_dns_wait gk.example.com && echo WAIT_OK || echo WAIT_ENDED'
+ck "waiting for DNS ends when the terminal is gone" bash -c "grep -q 'WAIT_ENDED' '$OUT' && grep -q 'terminal was closed' '$OUT'"
+new_world eof3; printf 'gk.example.com 198.51.100.9\n' >"$FAKE/dns4"
+run_case 'interactive() { return 0; }; ask_or_quit() { printf ""; }; start=$SECONDS; px_dns_wait gk.example.com && echo WAIT_OK || echo WAIT_CAPPED; echo "took=$((SECONDS-start))"'
+ck "even endless Enter presses stop after a cap (no infinite loop)" bash -c "grep -q 'WAIT_CAPPED' '$OUT' && grep -q 'Giving up waiting' '$OUT'"
+
+echo "a stuck install lock names the process that holds it"
+new_world lock1
+run_case 'L="$T/lockfile"; export GK_LOCK_FILE="$L"; ( exec 200>"$L"; flock -n 200; echo $BASHPID >"$T/holder"; exec sleep 20 ) & sleep 0.6; take_lock; echo SHOULD_NOT_REACH'
+ck "refused, naming a process and how to stop it" bash -c "grep -q 'Another install/update/backup is already running' '$OUT' && grep -q 'process [0-9]*: sleep 20' '$OUT' && grep -q 'sudo kill' '$OUT' && ! grep -q SHOULD_NOT_REACH '$OUT'"
+t "exit status 1" 1 "$RC"
+kill "$(cat "$T/holder" 2>/dev/null)" 2>/dev/null || true
+run_case 'L="$T/lockfile2"; export GK_LOCK_FILE="$L"; take_lock; echo LOCK_OK'
+ck "a free lock is taken normally" out_has "LOCK_OK"
+
+echo "the read-only commands work on a server that is not set up yet (no .env)"
+new_world noenv; rm -f "$T/app/.env"
+run_case 'COMMAND_ARGS=(gk.example.com); cmd_proxy_help'
+ck "proxy-help runs without .env and prints the guide" bash -c "grep -q 'STEP 7 OF 7' '$OUT' && ! grep -q 'Not configured yet' '$OUT'"
+run_case 'COMMAND_ARGS=(gk.example.com); cmd_proxy_check || true'
+ck "proxy-check runs without .env (it skips the login test and says so)" bash -c "grep -q 'Checking gk.example.com' '$OUT' && ! grep -q 'Not configured yet' '$OUT' && grep -q 'Skipped until section 4 passes\|admin password is not in' '$OUT' || grep -q '5. Login' '$OUT'"
+
+echo "web-restore without a terminal says how to approve it, and --yes works"
+new_world rs2
+run_case 'px_detect; px_web_backup >/dev/null; echo done'
+BK="$(ls "$T"/app/backups/web-config-*.tar.gz | head -1)"
+echo "# damaged" >>"$T/nginx/sites-available/ha"
+run_case "confirm_cmd() { \$ASSUME_YES && return 0; confirm \"\$@\"; }; COMMAND_ARGS=('$BK'); cmd_web_restore"
+ck "no terminal and no --yes: refuses, tells how to approve" bash -c "grep -q 'add --yes' '$OUT' && grep -q 'Cancelled' '$OUT' && grep -q damaged '$T/nginx/sites-available/ha'"
+run_case "confirm_cmd() { \$ASSUME_YES && return 0; confirm \"\$@\"; }; ASSUME_YES=true; COMMAND_ARGS=('$BK'); cmd_web_restore"
+ck "--yes restores" bash -c "! grep -q damaged '$T/nginx/sites-available/ha'"
+ck "--yes took a fresh safety copy of the damaged state first" bash -c "[[ \$(ls '$T/app/backups'/web-config-*.tar.gz | wc -l) -ge 2 ]]"
 
 # =================================================================================================== apply: success
 echo "apply: the happy path (new certificate)"

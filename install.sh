@@ -169,6 +169,7 @@ trim() {
   printf '%s' "$s"
 }
 
+# shellcheck disable=SC2120  # the optional folder argument is used by some callers only
 mktemp_tracked() { # mktemp_tracked [dir] -> path (removed on exit)
   local dir="${1:-${TMPDIR:-/tmp}}" f
   f="$(mktemp "$dir/gk.XXXXXX")"
@@ -705,6 +706,21 @@ ask() { # ask "Prompt" [default]
   fi
   tty_print "$C_BOLD$prompt${default:+ [$default]}:$C_RESET "
   IFS= read -r reply </dev/tty || reply=""
+  reply="$(trim "$reply")"
+  printf '%s' "${reply:-$default}"
+}
+
+# Like ask, but FAILS (status 1, prints nothing) when the terminal has gone away (end of input), instead of quietly
+# answering with the default. Loops that wait for the person must use this one: with plain ask a closed terminal
+# would make them spin forever, holding the install lock.
+ask_or_quit() { # ask_or_quit "Prompt" [default]
+  local prompt="$1" default="${2-}" reply=""
+  if ! interactive; then
+    printf '%s' "$default"
+    return 0
+  fi
+  tty_print "$C_BOLD$prompt${default:+ [$default]}:$C_RESET "
+  IFS= read -r reply </dev/tty || return 1
   reply="$(trim "$reply")"
   printf '%s' "${reply:-$default}"
 }
@@ -3320,8 +3336,10 @@ verify_all() { # verify_all [with-drill]
   if proxy_enabled; then verify_public
   elif px_managed; then
     vsection "Your nginx site and certificate (set up by this installer)"
+    # shellcheck disable=SC2034  # read by px_checks in deploy/proxy.sh
     PX_RENEW_DRYRUN=$JUST_INSTALLED
     px_checks "$(px_managed_host)"
+    # shellcheck disable=SC2034
     PX_RENEW_DRYRUN=false
   else verify_behind_proxy; fi
   verify_automation
@@ -5114,7 +5132,35 @@ take_lock() {
     lock="$STATE_DIR/install.lock"
   fi
   exec 200>"$lock"
-  flock -n 200 || die "Another install/update/backup is already running. Wait for it to finish."
+  if ! flock -n 200; then
+    local holders
+    holders="$(lock_holders "$lock" "$BASHPID")"
+    if [[ -n "$holders" ]]; then
+      err "Another install/update/backup is already running. Wait for it to finish. It is:"
+      while IFS= read -r line; do say "       $line"; done <<<"$holders"
+      say "  If you are sure it is stuck (for example a closed terminal left it waiting), stop it with:  sudo kill <the number above>"
+      say "  and run this again. Nothing was changed."
+      ROLLBACK_CAUSE="stopped: another install/update/backup is already running"
+      exit 1
+    fi
+    die "Another install/update/backup is already running. Wait for it to finish."
+  fi
+}
+
+# lock_holders FILE -> one "process 1234: command line" per process that has the lock file open (best effort)
+lock_holders() {
+  local f="$1" caller="${2:-0}" fd pid cmd real seen=" "
+  real="$(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+  for fd in /proc/[0-9]*/fd/*; do
+    [[ "$(readlink -f "$fd" 2>/dev/null)" == "$real" ]] || continue
+    pid="${fd#/proc/}"; pid="${pid%%/*}"
+    # not ourselves: the caller, this helper's own subshell and the main script
+    [[ "$pid" != "$caller" && "$pid" != "$BASHPID" && "$pid" != "$$" && "$seen" != *" $pid "* ]] || continue
+    seen+="$pid "
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-120)"
+    printf 'process %s: %s\n' "$pid" "${cmd:-?}"
+  done
+  return 0
 }
 
 # Running from a checkout? Otherwise fetch one (this is the `curl ... | sudo bash` path).
