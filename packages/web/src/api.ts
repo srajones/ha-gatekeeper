@@ -100,6 +100,10 @@ export type AlertsView = {
   history: Array<{ at: string; kind: "down" | "reminder" | "recovered" | "test"; results: AlertResult[] }>;
 };
 
+export type SetupFacts = { readableEntities: number; activeKeys: number; haRemote: boolean };
+
+export type SettingRecommendation = { key: keyof GatewaySettings; value: GatewaySettings[keyof GatewaySettings]; reason: string };
+
 export type ConnectionStatus = {
   settings: GatewaySettings;
   live: {
@@ -227,7 +231,13 @@ export const api = {
       method: "DELETE"
     }),
   settings: () =>
-    apiFetch<{ settings: GatewaySettings; defaults: GatewaySettings; help: SettingHelp[] }>("/admin/settings"),
+    apiFetch<{
+      settings: GatewaySettings;
+      defaults: GatewaySettings;
+      help: SettingHelp[];
+      facts?: SetupFacts;
+      recommendations?: SettingRecommendation[];
+    }>("/admin/settings"),
   saveSettings: (patch: Partial<GatewaySettings>) =>
     apiFetch<{ settings: GatewaySettings }>("/admin/settings", {
       method: "PUT",

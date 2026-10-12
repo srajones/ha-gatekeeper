@@ -4,6 +4,7 @@ import { HaStateHub, type HubLogger } from "./haHub.js";
 import { connectHaWebSocket } from "./haHubConnection.js";
 import { getHaToken } from "./haToken.js";
 import { parsePermission } from "./permissions.js";
+import { isRemoteHaUrl, type SetupFacts } from "./recommendations.js";
 
 let logger: HubLogger = {
   info: (message) => console.info(message),
@@ -44,4 +45,10 @@ export const haHub = new HaStateHub({
 // deleted). A no-op while the live connection is not in use.
 export function requestHubResubscribe(): void {
   haHub.requestResubscribe();
+}
+
+// What the dashboard bases its "recommended for your setup" hints on.
+export async function collectSetupFacts(): Promise<SetupFacts> {
+  const [readable, activeKeys] = await Promise.all([collectEntityIds(), prisma.client.count({ where: { status: "active" } })]);
+  return { readableEntities: readable.length, activeKeys, haRemote: isRemoteHaUrl(env.HA_BASE_URL) };
 }

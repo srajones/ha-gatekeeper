@@ -3,7 +3,8 @@ import rateLimit from "@fastify/rate-limit";
 import { prisma } from "./db.js";
 import { env } from "./env.js";
 import { fetchHaEntities, fetchHaServices, gatewayStatus } from "./ha.js";
-import { requestHubResubscribe } from "./hubRuntime.js";
+import { collectSetupFacts, requestHubResubscribe } from "./hubRuntime.js";
+import { recommendSettings } from "./recommendations.js";
 import { SETTINGS_HELP, defaultSettings, getSettings, parseSettingsPatch, resetSettings, saveSettings } from "./settings.js";
 import {
   auditQuerySchema,
@@ -406,7 +407,15 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
     if (!ensureAdmin(request, reply)) {
       return;
     }
-    return reply.send({ ok: true, settings: getSettings(), defaults: defaultSettings(), help: SETTINGS_HELP });
+    const facts = await collectSetupFacts();
+    return reply.send({
+      ok: true,
+      settings: getSettings(),
+      defaults: defaultSettings(),
+      help: SETTINGS_HELP,
+      facts,
+      recommendations: recommendSettings(facts)
+    });
   });
 
   app.put("/settings", async (request, reply) => {

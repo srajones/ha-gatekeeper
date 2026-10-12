@@ -44,6 +44,23 @@ Changes apply immediately, no restart. "Reset to recommended" restores all of th
 | **When the live link is down** | Ask Home Assistant, fall back to last known | What a read returns while the websocket is reconnecting. *Ask Home Assistant, fall back to last known*: fresh data if Home Assistant answers; if it cannot be reached either, the last known state marked `X-HA-Stale: 1`. *Last known state*: always the last known state with `X-HA-Stale: 1`, never extra requests while Home Assistant struggles. *Report an error*: `503 ha_unavailable`; use it when an old value is worse than none. |
 | **Requests per key per minute** | 100 (1 to 10000) | How often one API key may call this server (`429 rate_limited` above it). Protects this server; Home Assistant is protected by the options above. |
 
+### "Recommended for your setup"
+
+Under every option the dashboard shows what to pick **for you** and why, and a button to use it (nothing is saved until
+you press Save; "Use all N recommendations for my setup" fills in every difference at once). The advice is worked out
+from three facts shown in the "Your setup" card: how many entities your active keys can read, how many active keys
+there are, and whether Home Assistant is on your local network or reached over the internet.
+
+| Option | Recommendation | Reason |
+| --- | --- | --- |
+| How state reads are answered | Live subscription up to 2000 readable entities, "share answers briefly" above | the live link is not used above 2000 |
+| Sharing window | 2000 ms; 5000 ms when asking Home Assistant directly with more than 200 entities or 10 keys | sensors rarely change faster |
+| Requests at the same moment | 8; 4 when Home Assistant is remote, or with more than 200 entities read directly | protects a small Home Assistant and a rate-limited remote link |
+| When the live link is down | Ask Home Assistant, fall back to last known | choose "error" only if an old value is dangerous (locks, alarms) |
+| Requests per key per minute | 100 | about one request every 0.6 s per key |
+| Alert after | 120 s; 180 s when Home Assistant is remote | ignores restarts / internet blips |
+| Reminder every | 360 minutes | noticeable, not nagging |
+
 The two starting values can also be set in `.env` (`HA_STATE_CACHE_MS`, `HA_MAX_CONCURRENCY`); a value saved in the
 dashboard wins over `.env`. Every saved change is written to the audit log (`admin.settings.update`).
 

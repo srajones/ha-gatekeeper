@@ -209,6 +209,12 @@ test("the dashboard settings API: read, change (applies at once), validate, rese
   assert.equal(body.settings.stateSource, "subscription");
   assert.ok(body.help.length >= 5 && body.help.every((h: { label: string; summary: string }) => h.label && h.summary));
 
+  assert.ok(body.facts.readableEntities >= 1 && body.facts.activeKeys >= 1, "the setup facts come from the real keys");
+  assert.equal(body.facts.haRemote, false);
+  const recommended = Object.fromEntries(body.recommendations.map((r: { key: string; value: unknown }) => [r.key, r.value]));
+  assert.equal(recommended.stateSource, "subscription");
+  assert.ok(body.recommendations.every((r: { reason: string }) => r.reason.length > 20), "every recommendation says why");
+
   const unauth = await app.inject({ method: "GET", url: "/admin/settings" });
   assert.equal(unauth.statusCode, 401);
 

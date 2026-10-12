@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ConnectionStatus, GatewaySettings, SettingHelp } from "../api";
+import type { ConnectionStatus, GatewaySettings, SettingHelp, SettingRecommendation, SetupFacts } from "../api";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -10,6 +10,8 @@ type SettingsPageProps = {
   settings: GatewaySettings | null;
   defaults: GatewaySettings | null;
   help: SettingHelp[];
+  facts?: SetupFacts | null;
+  recommendations?: SettingRecommendation[];
   connection: ConnectionStatus | null;
   isLoading: boolean;
   hasError: boolean;
@@ -85,7 +87,98 @@ function ConnectionCard({ connection, mode }: { connection: ConnectionStatus | n
   );
 }
 
-function ChoiceField({ help, value, onChange }: { help: SettingHelp; value: string; onChange: (value: string) => void }) {
+function describeValue(help: SettingHelp, value: unknown): string {
+  const choice = help.choices?.find((c) => c.value === String(value));
+  if (choice) return stripRecommended(choice.label);
+  return `${value}${help.unit ? ` ${help.unit}` : ""}`;
+}
+
+function stripRecommended(label: string): string {
+  return label.replace(/\s*\(recommended\)\s*$/i, "");
+}
+
+// "Recommended for your setup" box under an option: what to pick, why, and a button to use it (the draft only;
+// nothing is saved until the administrator presses Save).
+function RecommendationNote({
+  help,
+  recommendation,
+  current,
+  onUse
+}: {
+  help: SettingHelp;
+  recommendation: SettingRecommendation | undefined;
+  current: unknown;
+  onUse: () => void;
+}) {
+  if (!recommendation) return null;
+  const same = String(current) === String(recommendation.value);
+  return (
+    <div
+      data-testid={`recommendation-${help.key}`}
+      className="rounded-md border border-[var(--primary-border)] bg-[var(--primary-soft)] px-3 py-2 text-sm text-[var(--foreground)]"
+    >
+      <p className="font-medium">
+        {same ? "You are using the recommended setting for your setup: " : "Recommended for your setup: "}
+        {describeValue(help, recommendation.value)}
+      </p>
+      <p className="mt-1 text-[var(--muted)]">{recommendation.reason}</p>
+      {!same ? (
+        <Button size="sm" variant="secondary" className="mt-2" onClick={onUse}>
+          Use {describeValue(help, recommendation.value)}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function SetupCard({ facts, differing, onApplyAll }: { facts: SetupFacts; differing: number; onApplyAll: () => void }) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Your setup</CardTitle>
+        <p className="text-sm text-[var(--muted)]">
+          The recommendations below are worked out from this. They change as you add or remove keys and entities, and nothing is changed
+          until you press Save.
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <dl className="grid gap-4 text-sm sm:grid-cols-3">
+          <div>
+            <dt className="text-[var(--muted)]">Entities your keys can read</dt>
+            <dd className="text-lg font-semibold">{facts.readableEntities}</dd>
+          </div>
+          <div>
+            <dt className="text-[var(--muted)]">Active API keys</dt>
+            <dd className="text-lg font-semibold">{facts.activeKeys}</dd>
+          </div>
+          <div>
+            <dt className="text-[var(--muted)]">Home Assistant is</dt>
+            <dd className="text-lg font-semibold">{facts.haRemote ? "reached over the internet" : "on your local network"}</dd>
+          </div>
+        </dl>
+        {differing > 0 ? (
+          <Button variant="secondary" onClick={onApplyAll}>
+            Use all {differing} recommendation{differing === 1 ? "" : "s"} for my setup
+          </Button>
+        ) : (
+          <p className="text-sm text-[var(--muted)]">Every option already matches the recommendation for your setup.</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ChoiceField({
+  help,
+  value,
+  onChange,
+  recommendation
+}: {
+  help: SettingHelp;
+  value: string;
+  onChange: (value: string) => void;
+  recommendation?: SettingRecommendation;
+}) {
   return (
     <fieldset className="space-y-2">
       <legend className="text-base font-semibold">{help.label}</legend>
@@ -108,12 +201,20 @@ function ChoiceField({ help, value, onChange }: { help: SettingHelp; value: stri
               className="mt-1"
             />
             <span>
-              <span className="block font-medium">{choice.label}</span>
+              <span className="block font-medium">
+                {stripRecommended(choice.label)}
+                {recommendation && String(recommendation.value) === choice.value ? (
+                  <Badge variant="success" className="ml-2">
+                    Recommended for you
+                  </Badge>
+                ) : null}
+              </span>
               <span className="block text-[var(--muted)]">{choice.description}</span>
             </span>
           </label>
         ))}
       </div>
+      <RecommendationNote help={help} recommendation={recommendation} current={value} onUse={() => onChange(String(recommendation?.value))} />
     </fieldset>
   );
 }
@@ -122,11 +223,13 @@ function NumberField({
   help,
   value,
   defaultValue,
+  recommendation,
   onChange
 }: {
   help: SettingHelp;
   value: number;
   defaultValue: number | undefined;
+  recommendation?: SettingRecommendation;
   onChange: (value: number) => void;
 }) {
   const id = `setting-${help.key}`;
@@ -150,9 +253,10 @@ function NumberField({
         <span className="text-sm text-[var(--muted)]">
           {help.unit}
           {help.min !== undefined && help.max !== undefined ? ` (${help.min} to ${help.max})` : ""}
-          {defaultValue !== undefined ? `; recommended: ${defaultValue}` : ""}
+          {!recommendation && defaultValue !== undefined ? `; recommended: ${defaultValue}` : ""}
         </span>
       </div>
+      <RecommendationNote help={help} recommendation={recommendation} current={value} onUse={() => onChange(Number(recommendation?.value))} />
     </div>
   );
 }
@@ -161,6 +265,8 @@ export function SettingsPage({
   settings,
   defaults,
   help,
+  facts,
+  recommendations = [],
   connection,
   isLoading,
   hasError,
@@ -190,6 +296,15 @@ export function SettingsPage({
     setDraft({ ...draft, [key]: value });
   };
 
+  const recFor = (key: keyof GatewaySettings) => recommendations.find((r) => r.key === key);
+  const differing = recommendations.filter((r) => String(draft[r.key]) !== String(r.value));
+  const applyAll = () => {
+    setSavedAt(null);
+    const next = { ...draft } as Record<string, unknown>;
+    for (const r of recommendations) next[r.key] = r.value;
+    setDraft(next as GatewaySettings);
+  };
+
   return (
     <div className="space-y-6">
       <section>
@@ -201,6 +316,7 @@ export function SettingsPage({
         </p>
       </section>
 
+      {facts && recommendations.length > 0 ? <SetupCard facts={facts} differing={differing.length} onApplyAll={applyAll} /> : null}
       <ConnectionCard connection={connection} mode={settings.stateSource} />
       <AlertsCard downAfterSeconds={settings.alertDownAfterSeconds} />
 
@@ -209,13 +325,20 @@ export function SettingsPage({
           {help.map((item) => {
             const value = draft[item.key];
             return item.choices ? (
-              <ChoiceField key={item.key} help={item} value={String(value)} onChange={(next) => set(item.key, next as never)} />
+              <ChoiceField
+                key={item.key}
+                help={item}
+                value={String(value)}
+                recommendation={recFor(item.key)}
+                onChange={(next) => set(item.key, next as never)}
+              />
             ) : (
               <NumberField
                 key={item.key}
                 help={item}
                 value={Number(value)}
                 defaultValue={defaults ? Number(defaults[item.key]) : undefined}
+                recommendation={recFor(item.key)}
                 onChange={(next) => set(item.key, next as never)}
               />
             );

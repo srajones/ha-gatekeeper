@@ -227,3 +227,10 @@ Docker bypasses ufw for published ports, so the app's own port stays bound to `1
 - **Private Home Assistant certificate**: provide the CA file in the wizard (`k`) or `HA_CA_FILE=`.
 - **Back up `.env`.** `API_KEY_HASH_SECRET` cannot be recovered; without it every issued token stops working.
 - Install log: `/var/log/ha-gatekeeper-install.log`; watchdog log: `/var/log/ha-gatekeeper-watchdog.log`.
+
+
+## Already running nginx and Let's Encrypt? Add a subdomain safely
+
+If this server already has nginx and certbot (or acme.sh) for other sites, use option 3 in the installer and follow
+[SUBDOMAIN_AND_CERTS.md](SUBDOMAIN_AND_CERTS.md): `sudo gatekeeper proxy-help` explains DNS, the certificate and the nginx
+file step by step (changing nothing itself), and `sudo gatekeeper proxy-check` tests the finished setup.

@@ -72,6 +72,10 @@ if [[ -n "$SELF_DIR" && -f "$SELF_DIR/deploy/lib.sh" ]]; then
   # shellcheck source=deploy/lib.sh
   source "$SELF_DIR/deploy/lib.sh"
 fi
+if [[ -n "$SELF_DIR" && -f "$SELF_DIR/deploy/proxy.sh" ]]; then
+  # shellcheck source=deploy/proxy.sh
+  source "$SELF_DIR/deploy/proxy.sh"
+fi
 
 ORIG_ARGS=("$@")
 COMMAND="install"
@@ -2812,7 +2816,7 @@ verify_behind_proxy() {
   if http_do GET "$url/healthz" "" --max-time 15 && [[ "$LAST_CODE" == 200 && "$LAST_BODY" == *'"ok":true'* ]]; then
     vpass "$url reaches Gatekeeper through your web server"
   else
-    vwarn "$url does not reach Gatekeeper yet (${LAST_ERR:-HTTP ${LAST_CODE:-none}})" "Forward it to http://127.0.0.1:${CFG[GATEKEEPER_PORT]} (the summary shows an nginx example), reload your web server, then run: gatekeeper verify"
+    vwarn "$url does not reach Gatekeeper yet (${LAST_ERR:-HTTP ${LAST_CODE:-none}})" "Forward it to http://127.0.0.1:${CFG[GATEKEEPER_PORT]} (the summary shows an nginx example), reload your web server, then run: gatekeeper verify. Step-by-step help: gatekeeper proxy-help; to test the whole chain: gatekeeper proxy-check"
   fi
 }
 
@@ -3506,17 +3510,23 @@ wizard_behind_proxy() {
   [[ "$cur" == https://* && "${WIZ_PREV_MODE:-}" == local ]] || cur=""
   say ""
   say "${C_BOLD}Do you already run a web server with HTTPS in front of this (nginx, Apache, Traefik...)?${C_RESET}"
-  say "  ${C_DIM}If yes, enter the public address it uses, for example https://ha.example.com. I will not touch that server;${C_RESET}"
-  say "  ${C_DIM}the summary at the end shows what to add to it. If no, press Enter and use an SSH tunnel.${C_RESET}"
+  say "  ${C_DIM}If yes, enter the NEW address Gatekeeper should have on it, for example https://gatekeeper.example.com (a subdomain of${C_RESET}"
+  say "  ${C_DIM}your own domain that is not used by anything else yet; NOT the address of Home Assistant). I will not touch that server;${C_RESET}"
+  say "  ${C_DIM}the summary at the end shows what to add to it, and 'sudo gatekeeper proxy-help' walks you through DNS, the certificate and${C_RESET}"
+  say "  ${C_DIM}the nginx file step by step. If no, press Enter and use an SSH tunnel.${C_RESET}"
   while true; do
     v="$(ask "Public https:// address of that web server (Enter for none)" "$cur")"
     v="${v%/}"
     if [[ -z "$v" ]]; then CFG[GATEKEEPER_PUBLIC_URL]=""; return 0; fi
     if [[ "$v" == https://* ]] && is_safe_url "$v" && [[ "$(url_authority "$v")" == "${v#https://}" ]]; then
+      if [[ -n "${CFG[HA_BASE_URL]:-}" && "$(url_host "$v")" == "$(url_host "${CFG[HA_BASE_URL]}" 2>/dev/null)" ]]; then
+        warn "$(url_host "$v") is the address of your Home Assistant. Gatekeeper needs its own new name (for example gatekeeper.$(url_host "$v" | sed 's/^[^.]*\.//'))."
+        continue
+      fi
       CFG[GATEKEEPER_PUBLIC_URL]="$v"
       return 0
     fi
-    warn "Please enter an address like https://ha.example.com (https only, no path)."
+    warn "Please enter an address like https://gatekeeper.example.com (https only, no path)."
   done
 }
 
@@ -4048,6 +4058,10 @@ print_summary() { # print_summary [failed]
         say "      ${C_BOLD}    proxy_set_header X-Forwarded-Proto \$scheme;${C_RESET}"
         say "      ${C_BOLD}}${C_RESET}"
         say "  ${C_DIM}then reload it (nginx -t && systemctl reload nginx) and run: gatekeeper verify${C_RESET}"
+        say ""
+        say "  ${C_BOLD}New subdomain, certificate, nginx file: don't know where to start?${C_RESET} Run  ${C_BOLD}sudo gatekeeper proxy-help${C_RESET}  for a"
+        say "  step-by-step guide (DNS record, Let's Encrypt certificate that leaves your existing ones alone, a ready nginx file)."
+        say "  Afterwards  ${C_BOLD}sudo gatekeeper proxy-check${C_RESET}  tests the whole chain and tells you what to fix. Both only look; they change nothing."
       else
         ip="$(public_ip 4 || echo '<server-ip>')"
         say ""
@@ -4931,6 +4945,9 @@ Commands
                      Set up where "Home Assistant / the server is down" messages go (e-mail, webhook, ntfy,
                      Telegram, heartbeat); 'alerts test' sends a test through every channel.
   2fa-reset          Switch the administrator's two-factor login off (phone AND recovery codes lost).
+  proxy-help [NAME]  Step-by-step guide to put Gatekeeper on a new subdomain behind the nginx and Let's Encrypt
+                     you already run (DNS, certificate, nginx file, tests). Read-only: changes nothing.
+  proxy-check [NAME] Tests that setup from every angle (DNS, certificate, nginx, login) and says what to fix.
   help
 
 Options
@@ -4984,7 +5001,7 @@ parse_args() {
       --quiet) QUIET=true ;;
       -v|--verbose) VERBOSE=true ;;
       --no-color) NO_COLOR_FLAG=true ;;
-      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|alerts|help)
+      install|verify|status|update|start|stop|restart|logs|backup|restore|uninstall|secrets|2fa-reset|alerts|proxy-help|proxy-check|help)
         if $have_command; then
           COMMAND_ARGS+=("$arg")
         else
@@ -5129,6 +5146,8 @@ main() {
   bootstrap_repo
   # shellcheck source=deploy/lib.sh
   source "$APP_DIR/deploy/lib.sh"
+  # shellcheck source=deploy/proxy.sh
+  [[ -f "$APP_DIR/deploy/proxy.sh" ]] && source "$APP_DIR/deploy/proxy.sh"
 
   # Re-entered after the download step above: pick up what that step changed so it can be undone too.
   if [[ -n "${GK_BOOT_TMP:-}" && -d "${GK_BOOT_TMP:-}" ]]; then
@@ -5160,6 +5179,8 @@ main() {
     secrets)   cmd_secrets ;;
     2fa-reset) cmd_2fa_reset ;;
     alerts)    cmd_alerts ;;
+    proxy-help)  cmd_proxy_help ;;
+    proxy-check) cmd_proxy_check ;;
     *)         usage; exit 1 ;;
   esac
 }

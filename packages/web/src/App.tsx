@@ -236,6 +236,8 @@ export default function App() {
           settings={settingsQuery.data?.settings ?? null}
           defaults={settingsQuery.data?.defaults ?? null}
           help={settingsQuery.data?.help ?? []}
+          facts={settingsQuery.data?.facts ?? null}
+          recommendations={settingsQuery.data?.recommendations ?? []}
           connection={connectionQuery.data ?? null}
           isLoading={settingsQuery.isLoading}
           hasError={settingsQuery.isError}
