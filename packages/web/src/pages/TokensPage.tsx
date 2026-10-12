@@ -101,7 +101,7 @@ export function TokensPage({
           </div>
 
           <Table>
-            <TableHeader>
+            <TableHeader className="max-sm:hidden">
               <TableRow>
                 <TableHead>Token</TableHead>
                 <TableHead>Access</TableHead>
@@ -120,22 +120,22 @@ export function TokensPage({
               ) : null}
               {clients.map((client) => (
                 <Fragment key={client.id}>
-                  <TableRow>
-                    <TableCell>
+                  <TableRow className="max-sm:block max-sm:py-2">
+                    <TableCell className="max-sm:block max-sm:py-1">
                       <div className="font-medium">{client.name}</div>
                       <div className="text-xs text-[var(--muted)]">Created {formatDate(client.createdAt)}</div>
                     </TableCell>
-                    <TableCell className="text-sm text-[var(--muted)]">{summarizeClient(client)}</TableCell>
-                    <TableCell>
+                    <TableCell className="text-sm text-[var(--muted)] max-sm:block max-sm:py-1">{summarizeClient(client)}</TableCell>
+                    <TableCell className="max-sm:block max-sm:py-1">
                       <Badge variant={client.status === "active" ? "success" : "danger"}>
                         {client.status}
                       </Badge>
                     </TableCell>
-                    <TableCell className="font-mono text-xs text-[var(--muted)]">
+                    <TableCell className="font-mono text-xs text-[var(--muted)] max-sm:block max-sm:py-1">
                       {client.apiKeyPrefix}
                     </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex flex-wrap justify-end gap-2">
+                    <TableCell className="text-right max-sm:block max-sm:py-1 max-sm:text-left">
+                      <div className="flex flex-wrap justify-end gap-2 max-sm:justify-start">
                         <Button
                           size="sm"
                           variant="secondary"
@@ -177,8 +177,8 @@ export function TokensPage({
                     </TableCell>
                   </TableRow>
                   {editingClientId === client.id ? (
-                    <TableRow>
-                      <TableCell colSpan={5}>
+                    <TableRow className="max-sm:block">
+                      <TableCell colSpan={5} className="max-sm:block">
                         <div className="space-y-4 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] p-4">
                           <DomainPermissionEditor
                             groups={draftGroups}

@@ -490,7 +490,13 @@ rv_stack_down() { # rv_stack_down PREEXISTING(0|1)
   if [[ -f "$APP_DIR/.env" ]]; then
     dc --profile proxy down --remove-orphans || return 1
   else
-    docker rm -f "$GK_CONTAINER" "$CADDY_CONTAINER" 2>/dev/null || true
+    # No .env to drive compose: remove by name, but only containers that really belong to this
+    # install directory (a container of someone else's that happens to share the name stays).
+    local c wd
+    for c in "$GK_CONTAINER" "$CADDY_CONTAINER"; do
+      wd="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$c" 2>/dev/null || true)"
+      [[ -n "$wd" && "$wd" == "$APP_DIR" ]] && docker rm -f "$c" >/dev/null 2>&1 || true
+    done
   fi
 }
 

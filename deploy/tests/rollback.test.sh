@@ -21,6 +21,17 @@ t() { # t "name" expected actual
 SHIM="$ROOT/shim"
 mkdir -p "$SHIM"
 
+# getent is stubbed from the start: a real one would resolve test host names such as ha.example.com
+# with the host's own /etc/hosts (a server that maps its own domain to itself would then look like
+# "Home Assistant on this server" and change the firewall tests' answers).
+cat >"$SHIM/getent" <<'EOF'
+#!/usr/bin/env bash
+echo "getent $*" >>"$FAKE/calls"
+[[ "$1" == group && "$2" == docker && -f "$FAKE/docker.group" ]] && { echo "docker:x:998:"; exit 0; }
+exit 2
+EOF
+chmod +x "$SHIM/getent"
+
 cat >"$SHIM/dpkg-query" <<'EOF'
 #!/usr/bin/env bash
 while read -r p; do [[ -n "$p" ]] && echo "ii  $p"; done <"$FAKE/pkgs"
@@ -606,17 +617,11 @@ ck "the verify failure sets a rollback cause" grep -q 'ROLLBACK_CAUSE="the final
 
 # ================================================================== Docker Engine leftovers (O2)
 echo "undoing Docker Engine also removes what the packages leave behind, only if this run created it"
-cat >"$SHIM/getent" <<'EOF'
-#!/usr/bin/env bash
-echo "getent $*" >>"$FAKE/calls"
-[[ "$1" == group && "$2" == docker && -f "$FAKE/docker.group" ]] && { echo "docker:x:998:"; exit 0; }
-exit 2
-EOF
 cat >"$SHIM/groupdel" <<'EOF'
 #!/usr/bin/env bash
 echo "groupdel $*" >>"$FAKE/calls"; rm -f "$FAKE/docker.group"
 EOF
-chmod +x "$SHIM/getent" "$SHIM/groupdel"
+chmod +x "$SHIM/groupdel"
 run_case dockerleft '
   touch "$FAKE/docker.group";   echo bash >"$FAKE/pkgs"; echo bash >"$T/snap"; : >"$T/before"
   rv_docker_engine "$T/snap" "$T/before" 0 0 0 1 || true
