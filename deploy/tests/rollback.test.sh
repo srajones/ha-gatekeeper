@@ -85,6 +85,8 @@ case "$1 $2" in
     [[ -f "$FAKE/ufw.rules" ]] && sed 's/^/ufw /' "$FAKE/ufw.rules"
     exit 0 ;;
 esac
+# like the real ufw: every change rewrites its rules files (so a rollback is not byte-identical unless the files are put back)
+if [[ -n "${GK_UFW_DIR:-}" && "$1" != status && "$1 $2" != "show added" ]]; then echo "rewritten by ufw $RANDOM" >"$GK_UFW_DIR/user.rules"; echo "rewritten6 by ufw $RANDOM" >"$GK_UFW_DIR/user6.rules"; fi
 case "$1" in
   status) [[ -f "$FAKE/ufw.active" ]] && echo "Status: active" || echo "Status: inactive"; exit 0 ;;
   allow) shift; echo "allow $(strip "$@")" >>"$FAKE/ufw.rules"; exit 0 ;;
@@ -319,6 +321,21 @@ ck "firewall is switched off BEFORE its rules are deleted (no lock-out window)" 
   del=\$(grep -n 'ufw --force delete' '$FAKE/calls' | head -1 | cut -d: -f1)
   [[ -n \$off && -n \$del && \$off -lt \$del ]]"
 
+run_case ufw_files '
+  : >"$FAKE/ufw.rules"
+  mkdir -p "$T/ufwdir"; export GK_UFW_DIR="$T/ufwdir"
+  printf "ORIGINAL v4 rules\n" >"$GK_UFW_DIR/user.rules"; printf "ORIGINAL v6 rules\n" >"$GK_UFW_DIR/user6.rules"
+  CFG[GATEKEEPER_MODE]=selfsigned; CFG[HA_BASE_URL]="https://ha.example.com"; CFG[GATEKEEPER_PORT]=8080
+  P_UFW_ENABLE=true; P_UFW_SSH_PORTS="22"
+  INSTALL_ACTIVE=true
+  open_firewall
+  [[ "$(cat "$GK_UFW_DIR/user.rules")" == rewritten* ]] || exit 51
+  exit 1
+'
+t "ufw's rules files are byte-identical again after the rollback (v4)" "ORIGINAL v4 rules" "$(cat "$T/ufwdir/user.rules")"
+t "ufw's rules files are byte-identical again after the rollback (v6)" "ORIGINAL v6 rules" "$(cat "$T/ufwdir/user6.rules")"
+ck "ufw is off again" test ! -f "$FAKE/ufw.active"
+
 run_case ufw_off_untouched '
   : >"$FAKE/ufw.rules"
   CFG[GATEKEEPER_MODE]=selfsigned; CFG[HA_BASE_URL]="https://ha.example.com"; CFG[GATEKEEPER_PORT]=8080
@@ -350,6 +367,7 @@ run_case swap '
 ck "swap file removed" test ! -e "$T/swapfile"
 t "fstab back to the original" "UUID=abc / ext4 defaults 0 1" "$(cat "$T/fstab")"
 ck "swapoff was called" calls_have "swapoff"
+ck "systemd is told to forget the generated swap unit (daemon-reload after the undo)" calls_have "systemctl daemon-reload"
 run_case swap_existing_line '
   printf "UUID=abc / ext4 defaults 0 1\n%s none swap sw 0 0\n" "$GK_SWAP_FILE" >"$GK_FSTAB_FILE"
   P_SWAP_MB=1024

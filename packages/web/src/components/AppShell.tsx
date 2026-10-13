@@ -11,22 +11,26 @@ type AppShellProps = {
   onTabChange: (tab: Tab) => void;
   onLogout: () => void;
   haStatus: "loading" | "connected" | "error";
+  // The live websocket can be reconnecting while ordinary requests still work.
+  liveLink?: "ok" | "reconnecting";
   children: ReactNode;
 };
 
-function statusLabel(status: AppShellProps["haStatus"]): string {
+function statusLabel(status: AppShellProps["haStatus"], liveLink: AppShellProps["liveLink"]): string {
+  if (status === "connected" && liveLink === "reconnecting") return "Home Assistant reachable, live link reconnecting";
   if (status === "connected") return "Home Assistant connected";
   if (status === "error") return "Home Assistant unavailable";
   return "Checking Home Assistant";
 }
 
-function statusVariant(status: AppShellProps["haStatus"]): "success" | "danger" | "warning" {
+function statusVariant(status: AppShellProps["haStatus"], liveLink: AppShellProps["liveLink"]): "success" | "danger" | "warning" {
+  if (status === "connected" && liveLink === "reconnecting") return "warning";
   if (status === "connected") return "success";
   if (status === "error") return "danger";
   return "warning";
 }
 
-export function AppShell({ activeTab, onTabChange, onLogout, haStatus, children }: AppShellProps) {
+export function AppShell({ activeTab, onTabChange, onLogout, haStatus, liveLink, children }: AppShellProps) {
   const { theme, toggleTheme } = useTheme();
 
   return (
@@ -55,7 +59,7 @@ export function AppShell({ activeTab, onTabChange, onLogout, haStatus, children 
             </nav>
 
             <div className="ml-auto flex flex-wrap items-center gap-2">
-              <Badge variant={statusVariant(haStatus)}>{statusLabel(haStatus)}</Badge>
+              <Badge variant={statusVariant(haStatus, liveLink)}>{statusLabel(haStatus, liveLink)}</Badge>
               <Button size="sm" variant="secondary" onClick={toggleTheme}>
                 {theme === "light" ? "Dark mode" : "Light mode"}
               </Button>

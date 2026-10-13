@@ -378,6 +378,16 @@ rv_docker_boot_disable() {
   systemctl disable docker.service docker.socket 2>/dev/null || true
 }
 
+# When this run turned ufw on, the undo (rule deletions + disable) leaves ufw's rules files logically empty but not
+# byte-identical (ufw rewrites its header). Put the saved copies back, only while ufw is off again.
+rv_ufw_files() { # rv_ufw_files BACKUP4 BACKUP6
+  local d="${GK_UFW_DIR:-/etc/ufw}"
+  have ufw || return 0
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then RV_NOTE="ufw is still active, so its rules files were not touched"; return 2; fi
+  [[ -n "$1" && -e "$1" ]] && cp -a -- "$1" "$d/user.rules"
+  [[ -n "${2:-}" && -e "$2" ]] && cp -a -- "$2" "$d/user6.rules"
+  return 0
+}
 rv_ufw_delete() { have ufw || return 0; ufw --force delete "$@"; }
 rv_ufw_disable() { have ufw || return 0; ufw --force disable; }
 
@@ -394,6 +404,8 @@ rv_firewalld() { # rv_firewalld service|port|rich VALUE
 rv_swap() { # rv_swap FILE
   swapoff "$1" 2>/dev/null || true
   rm -f -- "$1"
+  # systemd generates a swap unit from the fstab line; reload so it forgets that unit once the line is gone
+  if have_systemd; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
 }
 
 rv_fstab_line() { # rv_fstab_line FSTAB LINE
@@ -2256,7 +2268,11 @@ ufw_decide() {
 
 enable_ufw() {
   $P_UFW_ENABLE || return 0
-  local p
+  local p ud="${GK_UFW_DIR:-/etc/ufw}" b4="" b6=""
+  # queued FIRST so it is undone LAST: after the rules are deleted and ufw is switched off again
+  [[ -f "$ud/user.rules" ]] && b4="$(jbackup "$ud/user.rules")"
+  [[ -f "$ud/user6.rules" ]] && b6="$(jbackup "$ud/user6.rules")"
+  if [[ -n "$b4$b6" ]]; then jpush "Saved ufw's rules files (put back byte for byte if this run is undone)" rv_ufw_files "$b4" "$b6"; fi
   for p in $P_UFW_SSH_PORTS; do
     J_KEEP_NEXT=1 fw_ufw_allow 'SSH (HA Gatekeeper installer)' "$p/tcp" || return 0
   done
@@ -5270,7 +5286,7 @@ main() {
     2fa-reset) cmd_2fa_reset ;;
     alerts)    cmd_alerts ;;
     proxy-help)  cmd_proxy_help ;;
-    proxy-check) cmd_proxy_check ;;
+    proxy-check) cmd_proxy_check || exit $? ;;   # "not ready" is a verdict, not a crash: no "Stopped unexpectedly" banner
     web-backup)  cmd_web_backup ;;
     web-restore) cmd_web_restore ;;
     *)         usage; exit 1 ;;

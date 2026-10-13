@@ -59,8 +59,9 @@ export default function App() {
   const connectionQuery = useQuery({
     queryKey: ["connection"],
     queryFn: api.connection,
-    enabled: authenticated && tab === "Settings",
-    refetchInterval: 5000
+    // Needed on every page: the header must not say "connected" while the live link is reconnecting.
+    enabled: authenticated,
+    refetchInterval: tab === "Settings" ? 5000 : 20000
   });
 
   const saveSettingsMutation = useMutation({
@@ -191,12 +192,19 @@ export default function App() {
         ? "loading"
         : "connected";
 
+  const live = connectionQuery.data?.live;
+  const liveLink: "ok" | "reconnecting" =
+    connectionQuery.data?.settings.stateSource === "subscription" && live && live.running && !live.connected && live.subscribed > 0
+      ? "reconnecting"
+      : "ok";
+
   return (
     <AppShell
       activeTab={tab}
       onTabChange={setTab}
       onLogout={() => logoutMutation.mutate()}
       haStatus={haStatus}
+      liveLink={liveLink}
     >
       {tab === "Quick Start" ? (
         <QuickStartPage

@@ -93,3 +93,13 @@ sudo gatekeeper proxy-check [name]   tests the finished setup and says what to f
   restored the real `/etc/nginx` byte for byte, and `proxy-check` passed all 17 checks (login through the proxy,
   Secure cookie, renewal rehearsal). The certificate authority was a stand-in: a real Let's Encrypt issuance needs a
   real public domain and has not been run by the developer.
+
+## Testing the whole "Do it for me" flow on a throw-away server (no real domain)
+
+`deploy/tests/standin-certbot.sh` is a **test-only** stand-in for certbot. On a disposable box, install it as
+`/usr/local/bin/certbot`, map the test name to the server's own IP in `/etc/hosts`, and run the real installer with
+`PROXY_SETUP=nginx`: the plan, the safety copy, the nginx files, the "certificate", the renewal rehearsal and all 17
+checks run for real against the real nginx. Set `STANDIN_FAIL=dry|real|renew` (or put the word in
+`/etc/standin-certbot.fail`) to make the rehearsal, the real request or the renewal fail and watch the automatic undo.
+It adds the self-signed certificate to the system trust store so the installer's own checks can connect, and
+`certbot delete` removes it again. Never put it on a server you care about.

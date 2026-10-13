@@ -335,6 +335,19 @@ ck "proxy.sh never EXECUTES a mutating certbot/nginx/systemctl/ufw/docker subcom
 ck "proxy.sh never writes outside its own folder (no redirects into /etc, no tee/cp/mv/rm/ln/chmod on system paths)" bash -c "
   ! sed -E 's/\"([^\"\\\\]|\\\\.)*\"//g; s/#.*//' '$REPO/deploy/proxy.sh' | grep -nE '(^|[ ;|&(])(tee|cp|mv|rm|ln|install|sed -i|truncate|dd) '"
 
+echo "proxy-check run through the real command: a NOT-ready verdict is not a crash"
+reset_world
+OUT="$ROOT/out.realcmd.txt"
+( cd "$REPO" && env PATH="$SHIM:$PATH" FAKE="$FAKE" GK_LOG_FILE="$ROOT/real.log" GK_STATE_DIR="$ROOT/state" GK_LETSENCRYPT_DIR="$LE" GK_NGINX_DIR="$NG" \
+  FAKE_NGINX_DIR="$NG" GK_PX_SERVER_IP4=203.0.113.7 GK_PX_SERVER_IP6="" HOME="$ROOT/home" NO_COLOR=1 TERM=dumb \
+  GK_CERTBOT_BIN="$SHIM/certbot" GK_CERTBOT_CRON="$ROOT/no-certbot-cron" GK_CERTBOT_PLUGIN_SCAN=stub GK_NGINX_BIN="$SHIM/nginx" \
+  bash ./install.sh proxy-check gk.example.com ) >"$OUT" 2>&1
+RC=$?
+t "exit status is 1 (not ready)" 1 "$RC"
+ck "it prints the verdict" out_has "is NOT ready"
+ck "it does NOT print the crash banner" out_lacks "Stopped unexpectedly"
+ck "nor the 'safe to run again' crash hint" out_lacks "It is safe to run this script again"
+
 echo
 echo "RESULT: $pass passed, $failn failed"
 (( failn == 0 ))
